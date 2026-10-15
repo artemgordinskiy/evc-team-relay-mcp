@@ -319,6 +319,17 @@ The MCP server wraps Team Relay's REST API into standard MCP tools. Team Relay s
 
 [//]: # (mcp-name: io.github.entire-vc/evc-team-relay-mcp)
 
+<details>
+<summary>Find us in other directories</summary>
+
+<br>
+
+[![MCP Badge](https://lobehub.com/badge/mcp/entire-vc-evc-team-relay-mcp)](https://lobehub.com/mcp/entire-vc-evc-team-relay-mcp)
+[![Glama](https://img.shields.io/badge/Glama-listed-1F2937)](https://glama.ai/mcp/servers/entire-vc/evc-team-relay-mcp)
+[![Smithery](https://img.shields.io/badge/Smithery-listed-F26B21)](https://smithery.ai/servers/entirevc/evc-team-relay-mcp)
+
+</details>
+
 ## License
 
 MIT
