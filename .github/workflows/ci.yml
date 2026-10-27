@@ -1,7 +1,7 @@
 name: ci
 
 # Builds the wheel once, unit-tests the source, then integration-tests that
-# exact wheel against the stock control plane pinned in compat/manifest.json.
+# exact wheel against the control plane pinned in compat/manifest.json.
 # release.yml calls this workflow so a release ships the artifact tested here.
 
 on:
@@ -49,10 +49,21 @@ jobs:
       - run: uv run --locked pytest
 
   integration:
-    name: Integration (stock control plane + PostgreSQL)
+    name: Integration (control plane, ${{ matrix.workers }} worker(s) + PostgreSQL)
     needs: build
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1 is how the image runs by default; 4 makes writers contend for the
+        # share row lock from separate processes.
+        workers: [1, 4]
+    permissions:
+      contents: read
+      # The control-plane image is the relay fork's GHCR package.
+      packages: read
     env:
+      CP_WORKERS: ${{ matrix.workers }}
       # Generated per run and gitignored; never uploaded.
       STACK_ENV: tests/integration/.env
       COMPOSE: docker compose -f tests/integration/compose.yml --env-file tests/integration/.env
@@ -78,6 +89,12 @@ jobs:
                 echo "::add-mask::$value" ;;
             esac
           done < "$STACK_ENV"
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Start the stack
         run: $COMPOSE up --detach --wait --wait-timeout 300 control-plane

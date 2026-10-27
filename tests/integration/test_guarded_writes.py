@@ -1,4 +1,4 @@
-"""Guarded create/update through the MCP, against the stock control plane on
+"""Guarded create/update through the MCP, against the control plane on
 PostgreSQL. See conftest.py for the environment and the request budget.
 
 These prove the control plane's compare-and-swap as seen through this MCP.

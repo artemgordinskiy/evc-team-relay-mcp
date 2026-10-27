@@ -1,6 +1,6 @@
 """Fixtures for the guarded-write integration tests.
 
-The tests drive the MCP server as a real stdio subprocess against a stock
+The tests drive the MCP server as a real stdio subprocess against the
 control plane on PostgreSQL. They need:
 
   EVC_IT_CP_URL          control plane base URL

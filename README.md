@@ -46,7 +46,7 @@ against) and a GitHub build-provenance attestation. Install by pinned version
 and verify the hash:
 
 ```bash
-TAG=v1.0.9-homelab.1
+TAG=v1.0.9.1
 gh release download "$TAG" --repo artemgordinskiy/evc-team-relay-mcp \
   --pattern '*.whl' --pattern SHA256SUMS --dir evc-mcp
 (cd evc-mcp && sha256sum --ignore-missing --strict -c SHA256SUMS)
@@ -85,10 +85,18 @@ file again before deciding anything.
 ### Tested against
 
 `compat/manifest.json` pins the server release and image digests CI runs
-against. CI exercises the stock control plane on PostgreSQL and MinIO. It
-does **not** exercise the relay server or Obsidian clients, so it proves the
-control plane's compare-and-swap, not that clients converge on what was
-written.
+against. CI exercises the control plane on PostgreSQL and MinIO, with one
+uvicorn worker and with four. It does **not** exercise the relay server or
+Obsidian clients, so it proves the control plane's compare-and-swap, not that
+clients converge on what was written.
+
+The control plane is the homelab fork's image, not stock upstream. Stock
+v1.13.7 deadlocks a worker when two writes to one share race and the first
+is refused: it raises 412 while still holding the share's row lock, and the
+event loop that would release it is blocked by the second writer's lock
+wait. The fork ends that transaction before returning and runs the locked
+section off the event loop. Run this MCP against stock v1.13.7 and
+concurrent writers can hang the server; they cannot both win.
 
 ---
 

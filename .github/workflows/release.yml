@@ -1,14 +1,14 @@
 name: release
 
-# A tag vX.Y.Z-homelab.N runs the full CI on the tagged commit, then publishes
-# exactly the wheel and sdist that CI built and integration-tested, with
-# SHA256SUMS, the compatibility manifest and a provenance attestation.
-# The release stays a draft until the uploaded assets are downloaded again
-# and match SHA256SUMS by name and hash.
+# A tag vX.Y.Z.N (upstream release X.Y.Z plus fork revision N) runs the full
+# CI on the tagged commit, then publishes exactly the wheel and sdist that CI
+# built and integration-tested, with SHA256SUMS, the compatibility manifest
+# and a provenance attestation. The release stays a draft until the uploaded
+# assets are downloaded again and match SHA256SUMS by name and hash.
 
 on:
   push:
-    tags: ["v*-homelab.*"]
+    tags: ["v*.*.*.*"]
 
 permissions:
   contents: read
@@ -20,6 +20,9 @@ concurrency:
 jobs:
   ci:
     uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      packages: read
 
   publish:
     name: Publish GitHub release
@@ -45,8 +48,7 @@ jobs:
       - name: Check the tag matches the package version
         run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
-          # PEP 440 local version 1.0.9+homelab.1 <-> tag v1.0.9-homelab.1
-          expected="v${version/+/-}"
+          expected="v$version"
           if [ "$TAG" != "$expected" ]; then
             echo "::error::tag $TAG does not match package version $version (expected $expected)"
             exit 1
@@ -72,7 +74,7 @@ jobs:
           {
             echo "Guarded fork of entire-vc/evc-team-relay-mcp for the homelab."
             echo
-            echo "Tested in CI against the stock control plane and dependencies in compat-manifest.json."
+            echo "Tested in CI against the control plane and dependencies in compat-manifest.json."
             echo "Install the wheel by URL and verify it against SHA256SUMS."
             echo
             echo '```'

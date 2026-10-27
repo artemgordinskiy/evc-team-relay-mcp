@@ -1,13 +1,11 @@
-# Stock EVC Team Relay control plane on PostgreSQL + MinIO, for the guarded
-# write integration tests. Images come from compat/manifest.json via the .env
-# that stack_env.py writes; every secret in it is generated per run.
+# EVC Team Relay control plane on PostgreSQL + MinIO, for the guarded write
+# integration tests. Images come from compat/manifest.json via the .env that
+# stack_env.py writes; every secret in it is generated per run.
 #
-# Two deliberate differences from upstream infra/docker-compose.yml, neither
-# of which changes server code:
-#   - uvicorn runs with --workers 4. sync-write is `async def` with blocking
-#     DB calls, so a single worker serialises requests and the Postgres row
-#     lock would never be contended.
-#   - The bootstrap admin is created once by a one-shot service. With four
+# Two deliberate differences from upstream infra/docker-compose.yml:
+#   - CP_WORKERS sets the uvicorn worker count. CI runs 1 (the image's own
+#     default, as deployed) and 4 (writers contending across processes).
+#   - The bootstrap admin is created once by a one-shot service. With several
 #     workers, the startup bootstrap would race on the unique email.
 name: evc-relay-it
 
@@ -96,7 +94,7 @@ services:
   control-plane:
     image: ${CONTROL_PLANE_IMAGE:?}
     environment: *cp-env
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "${CP_WORKERS:?}"]
     ports:
       - "127.0.0.1:58000:8000"
     depends_on:

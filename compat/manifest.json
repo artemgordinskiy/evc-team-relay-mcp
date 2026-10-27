@@ -1,21 +1,32 @@
 {
   "schema": 1,
-  "description": "Upstream releases this fork was tested against. CI starts exactly these images; change them deliberately and rerun CI.",
+  "description": "Releases this fork was tested against. CI starts exactly these images; change them deliberately and rerun CI.",
   "mcp": {
     "upstream_repository": "https://github.com/entire-vc/evc-team-relay-mcp",
     "upstream_base_commit": "ad7b6d8084803c2606ee1e1d7952e5e9eea121ab",
     "upstream_pypi_release": "1.0.9"
   },
   "server": {
-    "repository": "https://github.com/entire-vc/evc-team-relay",
-    "tag": "v1.13.7",
-    "commit": "68eb84c23f85a99fb2dfd56821323b908f65e6ba",
+    "upstream_repository": "https://github.com/entire-vc/evc-team-relay",
+    "upstream_tag": "v1.13.7",
+    "upstream_commit": "68eb84c23f85a99fb2dfd56821323b908f65e6ba",
+    "control_plane_fork": {
+      "repository": "https://github.com/artemgordinskiy/evc-team-relay",
+      "tag": "v1.13.7.1",
+      "commit": "4aee64c99fa5f5d2df82a04c926adfbcf7771e26",
+      "base_commit": "0c009058ce9c54ac84ef28f3d58cd8d331205261",
+      "changes": [
+        "fix(shares): end sync-write's transaction before returning, off the event loop"
+      ]
+    },
     "images": {
-      "control_plane": "ghcr.io/entire-vc/evc-team-relay/control-plane:1.13.7@sha256:6251420afacd25f17cfc3300889bbed34945d697cf177d89bfaadbaa0d24038d",
+      "control_plane": "ghcr.io/artemgordinskiy/evc-team-relay/control-plane:v1.13.7.1@sha256:d9b03d58414c36206e2afced8bc7ab8963398b04d2ac8ad3065e808ef55fe977",
       "relay_server": "ghcr.io/entire-vc/evc-team-relay/relay-server:1.13.7@sha256:d3f56148960e519e0a0c4534e49297ac1da39a7e148f05a770ebc32c67da7dc1",
       "web_publish": "ghcr.io/entire-vc/evc-team-relay/web-publish:1.13.7@sha256:d4cdcf207785039ab19ebd3134bb6c72b75828a4264d13a1dcbff5221aace85c"
     },
-    "exercised_images": ["control_plane"]
+    "exercised_images": [
+      "control_plane"
+    ]
   },
   "plugin": {
     "repository": "https://github.com/entire-vc/evc-team-relay-plugin",
