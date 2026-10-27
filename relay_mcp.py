@@ -13,9 +13,12 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
+import re
 import time
+import uuid
 from typing import Annotated, Any
 
 import httpx
@@ -30,14 +33,15 @@ mcp = FastMCP(
         "EVC Team Relay tools for reading and writing Obsidian vault documents. "
         "Start by calling `authenticate` to get a token, then use `list_shares` "
         "to discover available shares. For folder shares, use `read_file`, "
-        "`list_files` and `tr_search` with file paths. Write access is "
-        "agent-key-only by design: `upsert_file` only writes in agent-key mode "
-        "(RELAY_AGENT_KEY / RELAY_AGENT_KEYS) — email/password (JWT) mode is "
-        "intentionally read-only, not a temporary gap. Separately, DOC-share "
-        "live content (`read_document`/`write_document`) and per-file delete "
-        "(`delete_file`) have no backend route in ANY auth mode yet — a "
-        "genuine backend gap, unrelated to the agent-key/JWT split. All of "
-        "these raise a clear error rather than silently failing."
+        "`list_files` and `tr_search` with file paths. Writes are guarded "
+        "compare-and-swap and agent-key-only: `read_file` returns the file's "
+        "`sha256`; pass it to `update_file` as `expected_sha256`, or use "
+        "`create_file` for a path that must not exist yet. A `stale` or "
+        "`exists` result means someone else changed the file: read it again, "
+        "merge, and decide yourself whether to write — nothing retries or "
+        "overwrites automatically. `read_file`, `create_file` and "
+        "`update_file` need the share UUID, not a web slug. Delete, rename "
+        "and DOC-share live content are not supported."
     ),
 )
 
@@ -48,10 +52,17 @@ _READ_ONLY = ToolAnnotations(
     idempotentHint=True,
     openWorldHint=True,
 )
-_WRITE = ToolAnnotations(
+# Neither write is idempotent: a repeated call fails its own precondition.
+_CREATE = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+)
+_UPDATE = ToolAnnotations(
     readOnlyHint=False,
     destructiveHint=True,
-    idempotentHint=True,
+    idempotentHint=False,
     openWorldHint=True,
 )
 
@@ -113,25 +124,6 @@ def _is_agent_key_mode() -> bool:
 
 def _agent_headers(key: str) -> dict[str, str]:
     return {"X-Agent-Key": key}
-
-
-def _resolve_share_kind(share_id: str, agent_key: str) -> str:
-    """Return 'folder' or 'doc' for the given share using agent-key auth.
-
-    Falls back to 'folder' if the endpoint is unavailable — upsert_file
-    is a folder-share tool, so this is the safe default.
-    """
-    try:
-        with _get_client() as client:
-            r = client.get(
-                f"{_get_base_url()}/v1/web/shares/{share_id}",
-                headers=_agent_headers(agent_key),
-            )
-            if r.status_code == 200:
-                return r.json().get("kind", "folder")
-    except Exception:
-        pass
-    return "folder"
 
 
 def _get_client() -> httpx.Client:
@@ -236,6 +228,132 @@ _JWT_WRITE_NOT_SANCTIONED = (
     "intentionally read-only (list_files/read_file/tr_search all work fine "
     "there). Configure an agent key instead."
 )
+
+
+# ── Guarded sync protocol (homelab fork) ─────────────────────
+#
+# Reads and writes use the control plane's sync protocol only:
+# GET /v1/shares/{uuid}/download + /files-index and PUT /v1/shares/{uuid}/sync-write.
+# sync-write enforces If-Match / If-None-Match: * under a row lock and answers
+# 412 instead of overwriting. The unconditional /v1/web/.../sync-upload and
+# /upload routes are deliberately unreachable from this server.
+
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _result_error(code: str, message: str, **extra: Any) -> dict[str, Any]:
+    return {"ok": False, "error": code, "message": message, **extra}
+
+
+def _share_uuid(share_id: str) -> str | None:
+    """Canonical share UUID, or None for a slug or malformed reference."""
+    try:
+        return str(uuid.UUID(share_id))
+    except ValueError:
+        return None
+
+
+def _invalid_share_id(share_id: str) -> dict[str, Any]:
+    return _result_error(
+        "invalid_share_id",
+        f"share_id must be the share UUID (got {share_id!r}); the guarded sync "
+        "protocol does not resolve web slugs",
+    )
+
+
+def _sync_headers(share_id: str) -> dict[str, str]:
+    agent_key = _get_key_for_share(share_id)
+    return _agent_headers(agent_key) if agent_key else _headers()
+
+
+def _etag_sha256(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    value = raw.strip()
+    if value.startswith("W/"):
+        value = value[2:].strip()
+    return value.strip('"').lower() or None
+
+
+def _server_detail(r: httpx.Response) -> str:
+    """The message from the control plane's {"error": {"code", "message"}} envelope."""
+    try:
+        message = r.json()["error"]["message"]
+    except (ValueError, KeyError, TypeError):
+        return r.text[:200]
+    return str(message)
+
+
+_CLIENT_ERROR_CODES = {
+    400: "bad_request",
+    401: "unauthorized",
+    403: "forbidden",
+    404: "not_found",
+    413: "too_large",
+    428: "precondition_required",
+    429: "rate_limited",
+}
+
+
+def _client_error(r: httpx.Response) -> dict[str, Any] | None:
+    """Structured result for an expected 4xx; None for anything else."""
+    code = _CLIENT_ERROR_CODES.get(r.status_code)
+    if code is None:
+        return None
+    return _result_error(code, _server_detail(r), status=r.status_code)
+
+
+def _sync_write(
+    share_id: str,
+    file_path: str,
+    content: str,
+    precondition: dict[str, str],
+    tool: str,
+    operation: str,
+) -> dict[str, Any]:
+    share_uuid = _share_uuid(share_id)
+    if share_uuid is None:
+        return _invalid_share_id(share_id)
+    agent_key = _get_key_for_share(share_id)
+    if not agent_key:
+        raise ValueError(_JWT_WRITE_NOT_SANCTIONED.format(tool=tool))
+    try:
+        body = content.encode("utf-8")
+    except UnicodeEncodeError as e:
+        return _result_error("not_utf8_text", f"content is not encodable as UTF-8: {e}")
+
+    with _get_client() as client:
+        r = client.put(
+            f"{_get_base_url()}/v1/shares/{share_uuid}/sync-write",
+            headers={
+                **_agent_headers(agent_key),
+                "Content-Type": "text/plain; charset=utf-8",
+                **precondition,
+            },
+            params={"path": file_path},
+            content=body,
+        )
+    if r.status_code == 200:
+        return {"ok": True, "operation": operation, **r.json()}
+    if r.status_code == 412:
+        detail = _server_detail(r)
+        if "If-None-Match" in precondition:
+            code = "exists"
+        elif detail.startswith("File not found"):
+            code = "not_found"
+        else:
+            code = "stale"
+        return _result_error(
+            code,
+            f"{detail}. Nothing was written. Read the file again and decide "
+            "whether to write; this tool never retries or overwrites.",
+            status=412,
+        )
+    structured = _client_error(r)
+    if structured is not None:
+        return structured
+    r.raise_for_status()
+    raise RuntimeError(f"Unexpected sync-write response: HTTP {r.status_code}")
 
 
 # ── MCP Tools ────────────────────────────────────────────────
@@ -530,61 +648,98 @@ def tr_search(
 def read_file(
     share_id: Annotated[
         str,
-        Field(description="UUID or web slug of the folder share, as returned by list_shares."),
+        Field(description="UUID of the folder share, as returned by list_shares."),
     ],
     file_path: Annotated[
         str, Field(description='Path to the file within the share, e.g. "notes/todo.md".')
     ],
 ) -> dict[str, Any]:
-    """Read one file from a shared folder by its path.
+    """Read one text file from a shared folder, with the token needed to update it.
 
     Read-only. Returns the full file content in one response — there is no
-    partial/range read.
+    partial/range read. Works with an agent key (needs `read` scope) or in
+    email/password mode; share_id must be the share UUID.
 
-    In agent-key mode (RELAY_AGENT_KEY is set): fetches via the agent-key
-    download endpoint; share_id may be a UUID or web slug.
+    The raw downloaded bytes are hashed and compared with both the download's
+    ETag and the share's sync file index. Only when all three agree is
+    `sha256` returned; pass it unchanged to `update_file` as `expected_sha256`.
+    Otherwise `sha256` is null and `write_token_withheld` says why:
+    "snapshot_mismatch" (the file changed between the two calls) or
+    "not_in_sync_index".
 
-    In email/password mode: fetches via the same CAS download endpoint used by
-    agent-key mode, over Bearer JWT instead of X-Agent-Key; share_id must be a UUID.
+    Text must be valid UTF-8 and is returned exactly (BOM and CRLF preserved).
+    Binary or invalid UTF-8 files are refused with error "not_utf8_text", and
+    bytes that differ from the stored file's ETag with "not_byte_exact".
 
     Args:
-        share_id: UUID or web slug of the folder share.
+        share_id: UUID of the folder share.
         file_path: File path within the folder (e.g. "Marketing/plan.md").
 
     Returns:
-        {"path", "content", "format"} on success, or {"error": ...} if the
-        file doesn't exist — two distinct shapes on the same 200-equivalent
-        outcome, hence dict[str, Any] rather than a strict per-field schema
-        (a stricter schema would reject the error shape as invalid output).
+        {"ok": true, "path", "content", "format": "text", "size", "sha256",
+        "write_token_withheld"} or {"ok": false, "error", "message", ...}.
     """
-    agent_key = _get_key_for_share(share_id)
-    if agent_key:
-        with _get_client() as client:
-            r = client.get(
-                f"{_get_base_url()}/v1/web/shares/{share_id}/download",
-                headers=_agent_headers(agent_key),
-                params={"path": file_path},
-            )
-            if r.status_code == 404:
-                return {"error": f"File not found: {file_path}"}
-            r.raise_for_status()
-        content_type = r.headers.get("content-type", "text/plain")
-        fmt = "markdown" if "text/" in content_type else "binary"
-        return {"path": file_path, "content": r.text, "format": fmt}
+    share_uuid = _share_uuid(share_id)
+    if share_uuid is None:
+        return _invalid_share_id(share_id)
+    headers = _sync_headers(share_id)
+    base = f"{_get_base_url()}/v1/shares/{share_uuid}"
 
-    # Email/password mode
     with _get_client() as client:
-        r = client.get(
-            f"{_get_base_url()}/v1/shares/{share_id}/download",
-            headers=_headers(),
-            params={"path": file_path},
+        r = client.get(f"{base}/download", headers=headers, params={"path": file_path})
+        if r.status_code != 200:
+            structured = _client_error(r)
+            if structured is not None:
+                return structured
+            r.raise_for_status()
+        # Index after download: a write landing in between shows up as a
+        # mismatch here, and one landing later fails the If-Match on update.
+        idx = client.get(f"{base}/files-index", headers=headers)
+        idx.raise_for_status()
+
+    raw = r.content
+    observed = hashlib.sha256(raw).hexdigest()
+    etag = _etag_sha256(r.headers.get("etag"))
+    # ETag and body come from the same index snapshot, so a mismatch is not a
+    # race: the server altered the stored bytes (it re-encodes inline text
+    # that is not valid UTF-8). Returning that text would invite a lossy write.
+    if etag is not None and etag != observed:
+        return _result_error(
+            "not_byte_exact",
+            f"The server returned different bytes from the ones it stored for "
+            f"{file_path}, which happens when the stored file is not valid "
+            "UTF-8. Refusing to return lossy content.",
+            path=file_path,
         )
-        if r.status_code == 404:
-            return {"error": f"File not found: {file_path}"}
-        r.raise_for_status()
-    content_type = r.headers.get("content-type", "text/plain")
-    fmt = "markdown" if "text/" in content_type else "binary"
-    return {"path": file_path, "content": r.text, "format": fmt}
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return _result_error(
+            "not_utf8_text",
+            f"{file_path} is binary or not valid UTF-8; this server reads and "
+            "writes UTF-8 text only",
+            path=file_path,
+            size=len(raw),
+            content_type=r.headers.get("content-type"),
+        )
+
+    indexed = next((i.get("sha256") for i in idx.json() if i.get("path") == file_path), None)
+    if indexed is None:
+        withheld = "not_in_sync_index"
+    elif etag is None or str(indexed).lower() != observed:
+        withheld = "snapshot_mismatch"
+    else:
+        withheld = None
+
+    return {
+        "ok": True,
+        "path": file_path,
+        "content": text,
+        "format": "text",
+        "size": len(raw),
+        "sha256": observed if withheld is None else None,
+        "write_token_withheld": withheld,
+    }
 
 
 @mcp.tool(annotations=_READ_ONLY)
@@ -614,124 +769,73 @@ def read_document(
     raise ValueError(_NO_BACKEND_ROUTE.format(tool="read_document"))
 
 
-@mcp.tool(annotations=_WRITE)
-def upsert_file(
-    share_id: Annotated[
-        str, Field(description="Share UUID (email/password mode) or web slug (agent-key mode).")
-    ],
-    file_path: Annotated[
-        str, Field(description='Path to the file within the share, e.g. "notes/todo.md".')
-    ],
-    content: Annotated[
-        str, Field(description="Full text content to write, replacing the file if it already exists.")
-    ],
-) -> dict[str, Any]:
-    """Create or overwrite a file in a shared folder; it syncs into subscribers' vaults. Agent key only.
-
-    **Write access is agent-key-only by design** — this is the sanctioned,
-    permanent policy (not a temporary gap): agent-key mode is the only
-    authorized write path in this MCP server.
-
-    **Agent key mode** (RELAY_AGENT_KEY is set):
-    - share_id may be the share UUID or web slug (e.g. "research-vault")
-    - Folder shares use /sync-upload → file enters the CRDT sync store and
-      appears in subscribers' local Obsidian vaults on the next sync cycle
-    - Doc shares fall back to /upload (web-publish only)
-    - list_files, read_file, and tr_search also work with the same agent key
-
-    **Email/password (JWT) mode** — always raises; intentionally read-only.
-    There is no write route reachable by JWT for an arbitrary (non-web-
-    published) folder share, and even if one existed, JWT mode stays
-    read-only by policy. Use agent-key mode for writes.
-
-    Args:
-        share_id: Share UUID (email/password mode) or web slug (agent key mode).
-        file_path: File path within the share (e.g. "notes/todo.md").
-        content: Full text content to write.
-
-    Returns:
-        Object with path, size/operation, and optional public_url (agent-key
-        mode). The exact set of keys is server-controlled (plus the
-        "operation" key added here), hence dict[str, Any].
-    """
-    agent_key = _get_key_for_share(share_id)
-    if agent_key:
-        # Route to sync-upload for folder shares (writes into CRDT sync store →
-        # subscribers' local vaults); fall back to upload for doc shares.
-        share_kind = _resolve_share_kind(share_id, agent_key)
-        upload_path = "sync-upload" if share_kind == "folder" else "upload"
-        with _get_client() as client:
-            r = client.post(
-                f"{_get_base_url()}/v1/web/shares/{share_id}/{upload_path}",
-                headers={
-                    "X-Agent-Key": agent_key,
-                    "Content-Type": "text/plain; charset=utf-8",
-                },
-                params={"path": file_path},
-                content=content.encode("utf-8"),
-            )
-            r.raise_for_status()
-            result = r.json()
-        result["operation"] = "uploaded"
-        return result
-
-    # Email/password (JWT) mode: writes are deliberately unsupported — agent-key
-    # mode is the sole sanctioned write path.
-    # Note: even /v1/web/shares/{slug}/files (JWT-capable) is not a safe substitute —
-    # it writes items without source=sync-artifact, which the files-index read path
-    # (both agent-key and JWT) filters out, so the write would silently vanish from
-    # every subsequent list_files/read_file call. An honest error beats that.
-    raise ValueError(_JWT_WRITE_NOT_SANCTIONED.format(tool="upsert_file"))
-
-
-@mcp.tool(annotations=_WRITE)
-def write_document(
-    share_id: Annotated[str, Field(description="UUID of the share, used for the access check.")],
-    doc_id: Annotated[str, Field(description="Document UUID.")],
-    content: Annotated[
-        str, Field(description="Full text content to write, replacing the entire document.")
-    ],
-    key: Annotated[str, Field(description="Yjs shared-type key holding the document content.")] = "contents",
-) -> dict[str, Any]:
-    """Reserved for live document writes; not yet available on the server, use upsert_file.
-
-    Always raises: the control-plane has no REST route for writing a
-    document's live content by ID (doc-share content is CRDT/WebSocket-only).
-    This is a genuine backend gap in BOTH agent-key and JWT mode, not an
-    agent-key-vs-JWT restriction — but were a route ever added, per the
-    sanctioned write policy (agent-key writes only) JWT mode would still be
-    read-only.
-
-    Args:
-        share_id: UUID of the share (for ACL check).
-        doc_id: Document UUID.
-        content: Full text content to write (replaces entire document).
-        key: Yjs shared type key. Default "contents".
-    """
-    raise ValueError(_NO_BACKEND_ROUTE.format(tool="write_document"))
-
-
-@mcp.tool(annotations=_WRITE)
-def delete_file(
+@mcp.tool(annotations=_CREATE)
+def create_file(
     share_id: Annotated[str, Field(description="UUID of the folder share.")],
     file_path: Annotated[
-        str, Field(description='Path to the file within the folder, e.g. "old-note.md".')
+        str, Field(description='Path of the new file within the share, e.g. "notes/todo.md".')
     ],
+    content: Annotated[str, Field(description="Full UTF-8 text content of the new file.")],
 ) -> dict[str, Any]:
-    """Reserved for per-file deletion; not yet available on the server.
+    """Create a new text file in a shared folder; fails if the path already exists. Agent key only.
 
-    Always raises: the control-plane has no DELETE route for an individual
-    folder-share file in ANY auth mode (agent-key or JWT) — this isn't a
-    JWT-vs-agent-key gap, per-file deletion simply isn't implemented
-    server-side yet. Note this is independent of the agent-key-only write
-    policy that governs upsert_file: even once/if a delete route lands, it
-    would follow that same policy (agent-key-only, JWT read-only).
+    Sends If-None-Match: * to the guarded sync-write endpoint, so an existing
+    file is never replaced: that case returns error "exists" and writes
+    nothing. Needs an agent key with `write` scope; email/password mode is
+    read-only by design.
 
     Args:
         share_id: UUID of the folder share.
-        file_path: File path within the folder (e.g. "old-note.md").
+        file_path: File path within the share (e.g. "notes/todo.md").
+        content: Full text content, written as UTF-8 bytes exactly as given.
+
+    Returns:
+        {"ok": true, "operation": "created", "path", "sha256", "size",
+        "updated_at"} — `sha256` is the token for the next update_file — or
+        {"ok": false, "error", "message", ...}.
     """
-    raise ValueError(_NO_BACKEND_ROUTE.format(tool="delete_file"))
+    return _sync_write(share_id, file_path, content, {"If-None-Match": "*"}, "create_file", "created")
+
+
+@mcp.tool(annotations=_UPDATE)
+def update_file(
+    share_id: Annotated[str, Field(description="UUID of the folder share.")],
+    file_path: Annotated[
+        str, Field(description='Path of the existing file within the share, e.g. "notes/todo.md".')
+    ],
+    content: Annotated[str, Field(description="Full UTF-8 text replacing the whole file.")],
+    expected_sha256: Annotated[
+        str,
+        Field(description="The `sha256` returned by read_file (or a previous write) for this file."),
+    ],
+) -> dict[str, Any]:
+    """Replace a text file only if it is unchanged since you read it. Agent key only.
+
+    Sends If-Match: "<expected_sha256>" to the guarded sync-write endpoint.
+    If anyone changed the file since that read, nothing is written and the
+    result is error "stale"; read the file again and merge before deciding
+    to write. Nothing retries automatically. Needs an agent key with `write`
+    scope; email/password mode is read-only by design.
+
+    Args:
+        share_id: UUID of the folder share.
+        file_path: File path within the share (e.g. "notes/todo.md").
+        content: Full text content, written as UTF-8 bytes exactly as given.
+        expected_sha256: Write token from read_file or the previous write.
+
+    Returns:
+        {"ok": true, "operation": "updated", "path", "sha256", "size",
+        "updated_at"} — `sha256` is the token for the next update — or
+        {"ok": false, "error", "message", ...}.
+    """
+    token = expected_sha256.strip().lower()
+    if not _SHA256_HEX.match(token):
+        return _result_error(
+            "invalid_expected_sha256",
+            "expected_sha256 must be the 64-character hex sha256 returned by "
+            "read_file; there is no unconditional write",
+        )
+    return _sync_write(share_id, file_path, content, {"If-Match": f'"{token}"'}, "update_file", "updated")
 
 
 # ── Entry point ──────────────────────────────────────────────

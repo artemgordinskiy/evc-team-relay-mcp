@@ -1,7 +1,11 @@
 # EVC Team Relay - MCP Server
 
-[![PyPI](https://img.shields.io/pypi/v/evc-team-relay-mcp)](https://pypi.org/project/evc-team-relay-mcp/)
-[![Docker Hub](https://img.shields.io/docker/v/deadalusevc/evc-team-relay-mcp?label=docker)](https://hub.docker.com/r/deadalusevc/evc-team-relay-mcp)
+> **Homelab fork.** This branch (`homelab`) replaces the unconditional
+> `upsert_file` with compare-and-swap writes, and is released only as tested
+> wheels on this repository's GitHub Releases. PyPI, Docker Hub, Smithery and
+> the `uvx evc-team-relay-mcp` snippets below install **upstream**, which still
+> has the unconditional write. See [Homelab fork](#homelab-fork) first.
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![MCP](https://img.shields.io/badge/MCP-server-4A90D9)](https://modelcontextprotocol.io)
 [![Smithery](https://img.shields.io/badge/Smithery-listed-6f42c1)](https://smithery.ai/servers/entirevc/evc-team-relay-mcp)
@@ -16,6 +20,75 @@ Works with **Claude Code**, **Codex CLI**, **OpenCode**, and any [MCP](https://m
 <a href="https://glama.ai/mcp/servers/@entire-vc/evc-team-relay-mcp">
   <img width="380" height="200" src="https://glama.ai/mcp/servers/@entire-vc/evc-team-relay-mcp/badge" alt="evc-team-relay-mcp MCP server" />
 </a>
+
+---
+
+## Homelab fork
+
+### What differs from upstream 1.0.9
+
+- `read_file` hashes the raw downloaded bytes and returns them as `sha256` only
+  when that hash, the download's ETag and the share's sync file index all
+  agree. Otherwise no token is returned (`write_token_withheld`).
+- `create_file` writes through `PUT /v1/shares/{id}/sync-write` with
+  `If-None-Match: *`; `update_file` writes there with `If-Match: "<sha256>"`.
+  A conflict returns a structured error and writes nothing. Nothing retries.
+- `upsert_file` and its unconditional `sync-upload` path are gone.
+  `write_document` and `delete_file` are gone; rename is not supported.
+- Text only: content must be valid UTF-8 and round-trips byte-exact, including
+  BOM and CRLF. Binary and invalid UTF-8 files are refused, never decoded lossily.
+
+### Install a release
+
+Each release carries the wheel and sdist that CI built and integration-tested,
+`SHA256SUMS`, `compat-manifest.json` (the exact server images it was tested
+against) and a GitHub build-provenance attestation. Install by pinned version
+and verify the hash:
+
+```bash
+TAG=v1.0.9-homelab.1
+gh release download "$TAG" --repo artemgordinskiy/evc-team-relay-mcp \
+  --pattern '*.whl' --pattern SHA256SUMS --dir evc-mcp
+(cd evc-mcp && sha256sum --ignore-missing --strict -c SHA256SUMS)
+gh attestation verify evc-mcp/*.whl --repo artemgordinskiy/evc-team-relay-mcp
+uv tool install evc-mcp/*.whl
+```
+
+Then use `"command": "evc-team-relay-mcp"` with no `args` in the client
+configurations below.
+
+### Agent keys and scopes
+
+Writes need an agent key with the `write` scope; reads need `read`. Give each
+agent its own key per share with `RELAY_AGENT_KEYS="<share-uuid>:<key>,..."`,
+and a read-only key where the agent should not write. Email/password (JWT) mode
+is read-only: write tools raise.
+
+### Errors
+
+Tools return `{"ok": false, "error": <code>, "message": ...}` for expected
+failures:
+
+| Code | Meaning | What the agent should do |
+| --- | --- | --- |
+| `stale` | The file changed since `expected_sha256` was read | `read_file` again and merge |
+| `exists` | `create_file` on a path that already exists | `read_file`, then `update_file` |
+| `not_found` | `update_file` on a missing file, or unknown share/path | Check the path; create it instead |
+| `not_utf8_text` | Binary or invalid UTF-8 file | Leave it alone |
+| `not_byte_exact` | The server re-encoded stored bytes (invalid UTF-8 stored inline) | Leave it alone |
+| `forbidden` | Key lacks the scope or the share | Use the right key |
+| `rate_limited`, `too_large`, `bad_request`, `precondition_required`, `unauthorized`, `invalid_share_id` | As named | Do not loop |
+
+Server errors (5xx) raise. The write may or may not have happened, so read the
+file again before deciding anything.
+
+### Tested against
+
+`compat/manifest.json` pins the server release and image digests CI runs
+against. CI exercises the stock control plane on PostgreSQL and MinIO. It
+does **not** exercise the relay server or Obsidian clients, so it proves the
+control plane's compare-and-swap, not that clients converge on what was
+written.
 
 ---
 
@@ -39,7 +112,7 @@ uv sync   # or: pip install .
 
 Add the MCP server to your tool's config. Choose one authentication method:
 
-**Agent key** (recommended) — create a key in the Obsidian plugin → Team Relay settings → **Agent Keys**. Supports read and write: `list_files`, `read_file`, `tr_search`, and `upsert_file` all work with a single key. [Quickstart →](https://github.com/entire-vc/evc-team-relay/blob/main/docs/agent-keys.md)
+**Agent key** (recommended) — create a key in the Obsidian plugin → Team Relay settings → **Agent Keys**. Supports read and write: `list_files`, `read_file`, `tr_search`, `create_file` and `update_file` work with a single key that has both scopes. [Quickstart →](https://github.com/entire-vc/evc-team-relay/blob/main/docs/agent-keys.md)
 
 **Email + password** — use a dedicated agent account on your Relay instance.
 
@@ -163,40 +236,26 @@ Your AI agent now has these tools:
 | `authenticate` | Authenticate with credentials (auto-managed) |
 | `list_shares` | List accessible shares (filter by kind, ownership) |
 | `list_files` | List files in a folder share |
-| **`read_file`** | Read a file by path from a folder share |
+| `tr_search` | Search files in shares |
+| **`read_file`** | Read a UTF-8 text file and get its `sha256` write token |
 | `read_document` | Not implemented — no backend route in any auth mode, always raises |
-| **`upsert_file`** | Create or update a file by path — **agent-key mode only**; raises in email/password (JWT) mode |
-| `write_document` | Not implemented — no backend route in any auth mode, always raises |
-| `delete_file` | Not implemented — no backend route in any auth mode, always raises |
+| **`create_file`** | Create a new file; refuses an existing path (`exists`) — **agent-key mode only** |
+| **`update_file`** | Replace a file only if its `sha256` still matches (`stale` otherwise) — **agent-key mode only** |
 
-**Typical workflow:** `list_shares` -> `list_files` -> `read_file` / `upsert_file`
+**Typical workflow:** `list_shares` -> `list_files` -> `read_file` -> `update_file`
+with the returned `sha256`, or `create_file` for a new path.
 
 Authentication is automatic — the server logs in and refreshes tokens internally.
 
 ### Tool availability matrix
 
-Not every tool works in every auth mode, and one group doesn't work in
-*either* mode — these are two unrelated facts, so don't conflate them:
-
 | Group | Tools | Status |
 |-------|-------|--------|
-| **Agent key**, folder shares | `list_files`, `read_file`, `upsert_file` | Working — **the only write path** in this MCP server |
+| **Agent key**, folder shares | `list_files`, `read_file`, `create_file`, `update_file` | Working; writes need the `write` scope |
 | **JWT** (email/password) | `list_files`, `tr_search`, `read_file` | Working, **read-only** by design |
-| **No backend route in either mode** | `read_document`, `write_document`, `delete_file` | Always raise `ValueError` — not an auth restriction |
+| **No backend route in either mode** | `read_document` | Always raises `ValueError` |
 
-- **Write access is agent-key-only, by sanctioned policy** (see
-  TR-05 (internal implementation record)):
-  `upsert_file` is the only write tool with a working backend route, and it
-  only writes when an agent key (`RELAY_AGENT_KEY` / `RELAY_AGENT_KEYS`) is
-  configured. JWT mode calling `upsert_file` raises a clear `ValueError`
-  naming agent-key mode as the fix, instead of a confusing 404.
-- **`read_document`, `write_document`, and `delete_file` are a separate,
-  independent gap** — the control plane has no backend route for them at
-  all, in agent-key mode either. Switching to an agent key will **not**
-  make them work: doc-share live content is CRDT/WebSocket-only (no REST
-  bridge), and per-file delete has no `DELETE` route server-side yet. If
-  routes for these are ever added, they'd still follow the agent-key-only
-  write policy above — JWT would stay read-only.
+Delete and rename are not supported.
 
 ---
 

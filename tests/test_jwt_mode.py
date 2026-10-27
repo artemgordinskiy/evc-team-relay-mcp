@@ -2,11 +2,12 @@
 /v1/documents/*, which never existed on the control-plane (confirmed absent
 across the full git history of evc-team-relay-cp). This suite covers the fix:
 
-- list_files / tr_search / read_file (JWT mode) now hit the real, working
-  /v1/shares/{id}/files-index and /v1/shares/{id}/download routes.
-- read_document, write_document, delete_file, and upsert_file (JWT mode) have
-  no backend route to fall back to and now raise a clear ValueError instead
-  of silently 404ing.
+- list_files / tr_search (JWT mode) now hit the real, working
+  /v1/shares/{id}/files-index route.
+- read_document has no backend route to fall back to and raises a clear
+  ValueError instead of silently 404ing.
+
+read_file and the guarded writes are covered in test_guarded_sync.py.
 """
 
 from __future__ import annotations
@@ -120,40 +121,6 @@ class TestTrSearchJwtMode:
         assert result == []
 
 
-class TestReadFileJwtMode:
-    def test_hits_shares_download_not_documents(self):
-        import relay_mcp
-
-        download_resp = MagicMock()
-        download_resp.status_code = 200
-        download_resp.text = "# Hello"
-        download_resp.headers = {"content-type": "text/plain"}
-        download_resp.raise_for_status = MagicMock()
-
-        client = _mock_client(get_resp=download_resp)
-        with patch.object(relay_mcp, "_get_client", return_value=client):
-            result = relay_mcp.read_file(SHARE_ID, FILE_PATH)
-
-        url = client.get.call_args[0][0]
-        assert url == f"{BASE_URL}/v1/shares/{SHARE_ID}/download"
-        assert "documents" not in url
-        assert client.get.call_args[1]["params"] == {"path": FILE_PATH}
-        assert result["content"] == "# Hello"
-        assert result["format"] == "markdown"
-
-    def test_404_returns_error_json_not_raise(self):
-        import relay_mcp
-
-        not_found = MagicMock()
-        not_found.status_code = 404
-        client = _mock_client(get_resp=not_found)
-
-        with patch.object(relay_mcp, "_get_client", return_value=client):
-            result = relay_mcp.read_file(SHARE_ID, "missing.md")
-
-        assert "error" in result
-
-
 class TestUnavailableDocumentTools:
     """No backend route exists for these — must raise, not silently 404."""
 
@@ -164,22 +131,4 @@ class TestUnavailableDocumentTools:
         with patch.object(relay_mcp, "_get_client", return_value=client) as get_client:
             with pytest.raises(ValueError, match="read_document"):
                 relay_mcp.read_document(SHARE_ID)
-        get_client.assert_not_called()
-
-    def test_write_document_raises_without_http_call(self):
-        import relay_mcp
-
-        client = MagicMock()
-        with patch.object(relay_mcp, "_get_client", return_value=client) as get_client:
-            with pytest.raises(ValueError, match="write_document"):
-                relay_mcp.write_document(SHARE_ID, "doc-1", "content")
-        get_client.assert_not_called()
-
-    def test_delete_file_raises_without_http_call(self):
-        import relay_mcp
-
-        client = MagicMock()
-        with patch.object(relay_mcp, "_get_client", return_value=client) as get_client:
-            with pytest.raises(ValueError, match="delete_file"):
-                relay_mcp.delete_file(SHARE_ID, FILE_PATH)
         get_client.assert_not_called()

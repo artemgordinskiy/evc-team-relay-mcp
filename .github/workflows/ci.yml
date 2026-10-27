@@ -1,0 +1,106 @@
+name: ci
+
+# Builds the wheel once, unit-tests the source, then integration-tests that
+# exact wheel against the stock control plane pinned in compat/manifest.json.
+# release.yml calls this workflow so a release ships the artifact tested here.
+
+on:
+  push:
+    branches: [homelab]
+  pull_request:
+    branches: [homelab]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          enable-cache: false
+      - run: uv build
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  unit:
+    name: Unit tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: false
+      - run: uv run --locked pytest
+
+  integration:
+    name: Integration (stock control plane + PostgreSQL)
+    needs: build
+    runs-on: ubuntu-24.04
+    env:
+      # Generated per run and gitignored; never uploaded.
+      STACK_ENV: tests/integration/.env
+      COMPOSE: docker compose -f tests/integration/compose.yml --env-file tests/integration/.env
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: "3.12"
+          enable-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+
+      - name: Generate throwaway stack secrets
+        run: |
+          python3 tests/integration/stack_env.py "$STACK_ENV"
+          while IFS='=' read -r key value; do
+            case "$key" in
+              *PASSWORD*|*SECRET*|*PRIVATE_KEY*|MINIO_ROOT_USER|EVC_IT_DATABASE_URL)
+                echo "::add-mask::$value" ;;
+            esac
+          done < "$STACK_ENV"
+
+      - name: Start the stack
+        run: $COMPOSE up --detach --wait --wait-timeout 300 control-plane
+
+      - name: Install the built wheel
+        run: |
+          uv venv "$RUNNER_TEMP/wheel-venv"
+          uv pip install --python "$RUNNER_TEMP/wheel-venv/bin/python" dist/*.whl
+          echo "EVC_IT_MCP_COMMAND=$RUNNER_TEMP/wheel-venv/bin/evc-team-relay-mcp" >> "$GITHUB_ENV"
+
+      - name: Integration tests
+        run: |
+          set -a
+          . "$STACK_ENV"
+          set +a
+          uv run --locked pytest -m integration tests/integration -v
+
+      - name: Control plane logs
+        if: failure()
+        run: $COMPOSE logs --no-color control-plane control-plane-migrate control-plane-bootstrap
+
+      - name: Stop the stack
+        if: always()
+        run: |
+          $COMPOSE down --volumes --remove-orphans
+          rm -f "$STACK_ENV"

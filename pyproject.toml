@@ -1,6 +1,6 @@
 [project]
 name = "evc-team-relay-mcp"
-version = "1.0.9"
+version = "1.0.9+homelab.1"
 description = "MCP server for reading and writing Obsidian vault documents via EVC Team Relay"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -53,6 +53,10 @@ relay-mcp = "relay_mcp:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Integration tests need the compose stack in tests/integration; select them
+# explicitly with `-m integration`.
+addopts = "-m 'not integration'"
+markers = ["integration: needs a running control plane (tests/integration)"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
@@ -65,4 +69,5 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
+    "psycopg[binary]>=3.2,<4",
 ]

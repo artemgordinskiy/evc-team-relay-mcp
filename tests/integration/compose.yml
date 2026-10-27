@@ -1,0 +1,119 @@
+# Stock EVC Team Relay control plane on PostgreSQL + MinIO, for the guarded
+# write integration tests. Images come from compat/manifest.json via the .env
+# that stack_env.py writes; every secret in it is generated per run.
+#
+# Two deliberate differences from upstream infra/docker-compose.yml, neither
+# of which changes server code:
+#   - uvicorn runs with --workers 4. sync-write is `async def` with blocking
+#     DB calls, so a single worker serialises requests and the Postgres row
+#     lock would never be contended.
+#   - The bootstrap admin is created once by a one-shot service. With four
+#     workers, the startup bootstrap would race on the unique email.
+name: evc-relay-it
+
+x-control-plane-env: &cp-env
+  DATABASE_URL: postgresql+psycopg://relay:${POSTGRES_PASSWORD:?}@postgres:5432/relay
+  JWT_SECRET: ${JWT_SECRET:?}
+  RELAY_PUBLIC_URL: wss://relay.invalid
+  RELAY_PRIVATE_KEY: ${RELAY_PRIVATE_KEY:?}
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:?}
+  MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?}
+  MINIO_BUCKET: relay
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:?}
+    environment:
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: relay
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay -d relay"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  minio:
+    image: ${MINIO_IMAGE:?}
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  minio-init:
+    image: ${MC_IMAGE:?}
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?}
+    entrypoint: >
+      /bin/sh -c '
+      mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" &&
+      mc mb --ignore-existing local/relay &&
+      mc anonymous set none local/relay
+      '
+
+  control-plane-migrate:
+    image: ${CONTROL_PLANE_IMAGE:?}
+    environment: *cp-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "-m", "alembic", "upgrade", "head"]
+
+  control-plane-bootstrap:
+    image: ${CONTROL_PLANE_IMAGE:?}
+    environment:
+      <<: *cp-env
+      BOOTSTRAP_ADMIN_EMAIL: ${ADMIN_EMAIL:?}
+      BOOTSTRAP_ADMIN_PASSWORD: ${ADMIN_PASSWORD:?}
+    depends_on:
+      control-plane-migrate:
+        condition: service_completed_successfully
+    # The server's own startup hook, run once.
+    command:
+      - python
+      - -c
+      - |
+        from app.db.session import get_sessionmaker
+        from app.services import auth_service
+        session = get_sessionmaker()()
+        try:
+            auth_service.bootstrap_admin_if_needed(session)
+        finally:
+            session.close()
+
+  control-plane:
+    image: ${CONTROL_PLANE_IMAGE:?}
+    environment: *cp-env
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+    ports:
+      - "127.0.0.1:58000:8000"
+    depends_on:
+      control-plane-bootstrap:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -c
+        - |
+          exec 3<>/dev/tcp/127.0.0.1/8000 &&
+          printf 'GET /health/ready HTTP/1.0\r\nHost: localhost\r\n\r\n' >&3 &&
+          read -r -t 4 status <&3 &&
+          [[ $$status == "HTTP/1.1 200 "* ]]
+      interval: 2s
+      timeout: 5s
+      retries: 60

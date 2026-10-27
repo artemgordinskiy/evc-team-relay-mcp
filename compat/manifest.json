@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "description": "Upstream releases this fork was tested against. CI starts exactly these images; change them deliberately and rerun CI.",
+  "mcp": {
+    "upstream_repository": "https://github.com/entire-vc/evc-team-relay-mcp",
+    "upstream_base_commit": "ad7b6d8084803c2606ee1e1d7952e5e9eea121ab",
+    "upstream_pypi_release": "1.0.9"
+  },
+  "server": {
+    "repository": "https://github.com/entire-vc/evc-team-relay",
+    "tag": "v1.13.7",
+    "commit": "68eb84c23f85a99fb2dfd56821323b908f65e6ba",
+    "images": {
+      "control_plane": "ghcr.io/entire-vc/evc-team-relay/control-plane:1.13.7@sha256:6251420afacd25f17cfc3300889bbed34945d697cf177d89bfaadbaa0d24038d",
+      "relay_server": "ghcr.io/entire-vc/evc-team-relay/relay-server:1.13.7@sha256:d3f56148960e519e0a0c4534e49297ac1da39a7e148f05a770ebc32c67da7dc1",
+      "web_publish": "ghcr.io/entire-vc/evc-team-relay/web-publish:1.13.7@sha256:d4cdcf207785039ab19ebd3134bb6c72b75828a4264d13a1dcbff5221aace85c"
+    },
+    "exercised_images": ["control_plane"]
+  },
+  "plugin": {
+    "repository": "https://github.com/entire-vc/evc-team-relay-plugin",
+    "version": "0.0.38",
+    "commit": "2c5edcde05b60cb8e1cc040f674c21daeb11038e",
+    "exercised": false,
+    "note": "Recorded for the deployment set only. Live Obsidian/Yjs convergence is not tested here."
+  },
+  "dependencies": {
+    "postgres": "postgres:16.15@sha256:9e2cf6287f25c3151f4c9421ccce2b17f3e60061c111a29165e0d2cdd9ff0a97",
+    "minio": "pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372",
+    "mc": "pgsty/mc:RELEASE.2026-09-16T00-00-00Z@sha256:cfc83108c3abb371f8fb84d99c1fdc88f8c237e022409b0081fb7c0a3be634dd"
+  }
+}
