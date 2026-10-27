@@ -35,11 +35,17 @@ dependencies = [
     # 1.10.0 — confirmed by downloading the published 1.7.0-1.10.1 wheels and
     # grepping func_metadata.py: absent through 1.9.4, present from 1.10.0.
     # relay_mcp.py's dict[str, Any]-returning tools rely on it for outputSchema.
-    "mcp[cli]>=1.10.0,<2",
+    # Floor raised to 1.30.0 for GHSA-84m7-p3x7-pcfv: earlier stateful
+    # streamable-HTTP servers (this one's --transport http) accumulate
+    # sessions without bound.
+    "mcp[cli]>=1.30.0,<2",
     "httpx>=0.27.0",
     # Transitive via mcp; floor set so non-lock installs also get the fixes
     # for GHSA-9j54-fg26-wv3r, GHSA-r6x4-923q-g947, GHSA-w2cx-738m-mc7w.
     "pyjwt>=2.14.0",
+    # Transitive via httpx; GHSA-6q48-6c7w-9gw2 (compromised emSign
+    # intermediates) is fixed from 2026.10.19.
+    "certifi>=2026.10.19",
 ]
 
 [project.urls]
