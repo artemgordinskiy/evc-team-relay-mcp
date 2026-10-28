@@ -39,7 +39,7 @@ uv sync   # or: pip install .
 
 Add the MCP server to your tool's config. Choose one authentication method:
 
-**Agent key** (recommended) — create a key in the Obsidian plugin → Team Relay settings → **Agent Keys**. Supports read and write: `list_files`, `read_file`, `tr_search`, and `upsert_file` all work with a single key. [Quickstart →](https://github.com/entire-vc/evc-team-relay/blob/main/docs/agent-keys.md)
+**Agent key** (recommended) — create a key in the Obsidian plugin → Team Relay settings → **Agent Keys**. Supports read and write: `list_files`, `read_file`, `tr_search`, `create_file`, `update_file` and `upsert_file` all work with a single key. [Quickstart →](https://github.com/entire-vc/evc-team-relay/blob/main/docs/agent-keys.md)
 
 **Email + password** — use a dedicated agent account on your Relay instance.
 
@@ -163,13 +163,33 @@ Your AI agent now has these tools:
 | `authenticate` | Authenticate with credentials (auto-managed) |
 | `list_shares` | List accessible shares (filter by kind, ownership) |
 | `list_files` | List files in a folder share |
-| **`read_file`** | Read a file by path from a folder share |
+| **`read_file`** | Read a file by path from a folder share; returns a `sha256` token for `update_file` |
 | `read_document` | Not implemented — no backend route in any auth mode, always raises |
-| **`upsert_file`** | Create or update a file by path — **agent-key mode only**; raises in email/password (JWT) mode |
+| **`create_file`** | Create a file only if the path is free; returns `exists` otherwise — **agent-key mode only** |
+| **`update_file`** | Overwrite a file only if it still matches the `sha256` you read; returns `stale` otherwise — **agent-key mode only** |
+| **`upsert_file`** | Create or overwrite a file unconditionally (last writer wins) — **agent-key mode only**; raises in email/password (JWT) mode |
 | `write_document` | Not implemented — no backend route in any auth mode, always raises |
 | `delete_file` | Not implemented — no backend route in any auth mode, always raises |
 
-**Typical workflow:** `list_shares` -> `list_files` -> `read_file` / `upsert_file`
+**Typical workflow:** `list_shares` -> `list_files` -> `read_file` -> `update_file` with the returned `sha256` (or `create_file` for a new path)
+
+### Guarded writes
+
+`upsert_file` overwrites whatever is there, so an edit a person makes in Obsidian
+between the agent's read and its write is silently lost. `create_file` and
+`update_file` use the control plane's `PUT /v1/shares/{share_id}/sync-write`
+(control plane 1.12.0 or later) with a precondition instead:
+
+- `read_file` returns `sha256`, the hash of the exact bytes it downloaded. It is
+  `null` when the returned text is not those bytes decoded as UTF-8 (binary
+  files, or text served in another charset), because writing that text back
+  would change bytes the agent never edited.
+- `update_file` sends it as `If-Match`; `create_file` sends `If-None-Match: *`.
+- If the file changed, already exists or was deleted, nothing is written and
+  the tool returns `{"error": "stale" | "exists" | "not_found", ...}`. Nothing
+  retries automatically: the agent should read again and decide.
+- Content is written as UTF-8 exactly as given; line endings and a BOM are kept.
+- Both take the share UUID, not a web slug.
 
 Authentication is automatic — the server logs in and refreshes tokens internally.
 
@@ -180,16 +200,17 @@ Not every tool works in every auth mode, and one group doesn't work in
 
 | Group | Tools | Status |
 |-------|-------|--------|
-| **Agent key**, folder shares | `list_files`, `read_file`, `upsert_file` | Working — **the only write path** in this MCP server |
+| **Agent key**, folder shares | `list_files`, `read_file`, `create_file`, `update_file`, `upsert_file` | Working — **the only write path** in this MCP server |
 | **JWT** (email/password) | `list_files`, `tr_search`, `read_file` | Working, **read-only** by design |
 | **No backend route in either mode** | `read_document`, `write_document`, `delete_file` | Always raise `ValueError` — not an auth restriction |
 
 - **Write access is agent-key-only, by sanctioned policy** (see
   TR-05 (internal implementation record)):
-  `upsert_file` is the only write tool with a working backend route, and it
-  only writes when an agent key (`RELAY_AGENT_KEY` / `RELAY_AGENT_KEYS`) is
-  configured. JWT mode calling `upsert_file` raises a clear `ValueError`
-  naming agent-key mode as the fix, instead of a confusing 404.
+  `create_file`, `update_file` and `upsert_file` are the write tools with a
+  working backend route, and they only write when an agent key
+  (`RELAY_AGENT_KEY` / `RELAY_AGENT_KEYS`) is configured. JWT mode calling
+  any of them raises a clear `ValueError` naming agent-key mode as the fix,
+  instead of a confusing 404.
 - **`read_document`, `write_document`, and `delete_file` are a separate,
   independent gap** — the control plane has no backend route for them at
   all, in agent-key mode either. Switching to an agent key will **not**

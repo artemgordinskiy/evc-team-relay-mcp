@@ -13,9 +13,12 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 import sys
 import time
+import uuid
 from typing import Annotated, Any
 
 import httpx
@@ -30,8 +33,12 @@ mcp = FastMCP(
         "EVC Team Relay tools for reading and writing Obsidian vault documents. "
         "Start by calling `authenticate` to get a token, then use `list_shares` "
         "to discover available shares. For folder shares, use `read_file`, "
-        "`list_files` and `tr_search` with file paths. Write access is "
-        "agent-key-only by design: `upsert_file` only writes in agent-key mode "
+        "`list_files` and `tr_search` with file paths. To change a file, "
+        "prefer `update_file` with the `sha256` that `read_file` returned, "
+        "and `create_file` for a new path: both write only if the file is "
+        "still as you read it, and report `stale` or `exists` otherwise. "
+        "`upsert_file` overwrites unconditionally. Write access is "
+        "agent-key-only by design: the write tools only write in agent-key mode "
         "(RELAY_AGENT_KEY / RELAY_AGENT_KEYS) — email/password (JWT) mode is "
         "intentionally read-only, not a temporary gap. Separately, DOC-share "
         "live content (`read_document`/`write_document`) and per-file delete "
@@ -52,6 +59,19 @@ _WRITE = ToolAnnotations(
     readOnlyHint=False,
     destructiveHint=True,
     idempotentHint=True,
+    openWorldHint=True,
+)
+# Neither guarded write is idempotent: repeating one fails its own precondition.
+_CREATE = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+)
+_UPDATE = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=False,
     openWorldHint=True,
 )
 
@@ -236,6 +256,75 @@ _JWT_WRITE_NOT_SANCTIONED = (
     "intentionally read-only (list_files/read_file/tr_search all work fine "
     "there). Configure an agent key instead."
 )
+
+
+def _write_token(raw: bytes, text: str) -> str | None:
+    """sha256 of the downloaded bytes, for update_file's If-Match.
+
+    Only issued when `text` is exactly those bytes decoded as UTF-8: an agent
+    edits the text it was given, so a token for a lossy decoding (binary
+    content, another charset) would let it overwrite bytes it never saw.
+    """
+    try:
+        exact = raw.decode("utf-8") == text
+    except UnicodeDecodeError:
+        return None
+    return hashlib.sha256(raw).hexdigest() if exact else None
+
+
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _guarded_write(
+    share_id: str,
+    file_path: str,
+    content: str,
+    precondition: dict[str, str],
+    tool: str,
+    operation: str,
+) -> dict[str, Any]:
+    """PUT /v1/shares/{uuid}/sync-write. The control plane checks the precondition
+    against the file's current sha256 under a row lock, and answers 412 instead
+    of writing when it fails."""
+    try:
+        share_uuid = str(uuid.UUID(share_id))
+    except ValueError:
+        return {
+            "error": "invalid_share_id",
+            "message": f"{tool} needs the share UUID, not a web slug (got {share_id!r}).",
+        }
+    agent_key = _get_key_for_share(share_id)
+    if not agent_key:
+        raise ValueError(_JWT_WRITE_NOT_SANCTIONED.format(tool=tool))
+    with _get_client() as client:
+        r = client.put(
+            f"{_get_base_url()}/v1/shares/{share_uuid}/sync-write",
+            headers={
+                "X-Agent-Key": agent_key,
+                "Content-Type": "text/plain; charset=utf-8",
+                **precondition,
+            },
+            params={"path": file_path},
+            content=content.encode("utf-8"),
+        )
+        if r.status_code == 412:
+            if "If-None-Match" in precondition:
+                code, state = "exists", "already exists"
+            elif "File not found" in r.text:
+                code, state = "not_found", "no longer exists"
+            else:
+                code, state = "stale", "changed since you read it"
+            return {
+                "error": code,
+                "message": (
+                    f"Nothing was written: {file_path} {state}. "
+                    "Read it again and decide whether to write; nothing retries automatically."
+                ),
+            }
+        r.raise_for_status()
+        result = r.json()
+    result["operation"] = operation
+    return result
 
 
 # ── MCP Tools ────────────────────────────────────────────────
@@ -551,9 +640,13 @@ def read_file(
         share_id: UUID or web slug of the folder share.
         file_path: File path within the folder (e.g. "Marketing/plan.md").
 
+    `sha256` is the token to pass to update_file as `expected_sha256`. It is
+    null when `content` is not the file's exact bytes as UTF-8 (binary files,
+    other encodings), since editing that text would write a lossy copy.
+
     Returns:
-        {"path", "content", "format"} on success, or {"error": ...} if the
-        file doesn't exist — two distinct shapes on the same 200-equivalent
+        {"path", "content", "format", "sha256"} on success, or {"error": ...} if
+        the file doesn't exist — two distinct shapes on the same 200-equivalent
         outcome, hence dict[str, Any] rather than a strict per-field schema
         (a stricter schema would reject the error shape as invalid output).
     """
@@ -570,7 +663,12 @@ def read_file(
             r.raise_for_status()
         content_type = r.headers.get("content-type", "text/plain")
         fmt = "markdown" if "text/" in content_type else "binary"
-        return {"path": file_path, "content": r.text, "format": fmt}
+        return {
+            "path": file_path,
+            "content": r.text,
+            "format": fmt,
+            "sha256": _write_token(r.content, r.text),
+        }
 
     # Email/password mode
     with _get_client() as client:
@@ -584,7 +682,12 @@ def read_file(
         r.raise_for_status()
     content_type = r.headers.get("content-type", "text/plain")
     fmt = "markdown" if "text/" in content_type else "binary"
-    return {"path": file_path, "content": r.text, "format": fmt}
+    return {
+        "path": file_path,
+        "content": r.text,
+        "format": fmt,
+        "sha256": _write_token(r.content, r.text),
+    }
 
 
 @mcp.tool(annotations=_READ_ONLY)
@@ -614,6 +717,82 @@ def read_document(
     raise ValueError(_NO_BACKEND_ROUTE.format(tool="read_document"))
 
 
+@mcp.tool(annotations=_CREATE)
+def create_file(
+    share_id: Annotated[str, Field(description="UUID of the folder share.")],
+    file_path: Annotated[
+        str, Field(description='Path of the new file within the share, e.g. "notes/todo.md".')
+    ],
+    content: Annotated[str, Field(description="Full text content of the new file.")],
+) -> dict[str, Any]:
+    """Create a new file in a shared folder; never replaces an existing one. Agent key only.
+
+    Sends If-None-Match: * to the control plane's sync-write route. If the
+    path already exists, nothing is written and the result is
+    {"error": "exists"}: read the file and use update_file instead.
+
+    Needs an agent key with write scope and the share UUID (not a web slug);
+    email/password (JWT) mode raises, as for every write tool.
+
+    Args:
+        share_id: UUID of the folder share.
+        file_path: File path within the share (e.g. "notes/todo.md").
+        content: Full text content, written as UTF-8.
+
+    Returns:
+        The server's result (path, sha256, size, updated_at) plus
+        "operation": "created", or {"error", "message"} if it was refused.
+        The returned sha256 is the token for the next update_file.
+    """
+    return _guarded_write(
+        share_id, file_path, content, {"If-None-Match": "*"}, "create_file", "created"
+    )
+
+
+@mcp.tool(annotations=_UPDATE)
+def update_file(
+    share_id: Annotated[str, Field(description="UUID of the folder share.")],
+    file_path: Annotated[
+        str, Field(description='Path of the existing file within the share, e.g. "notes/todo.md".')
+    ],
+    content: Annotated[str, Field(description="Full text content replacing the whole file.")],
+    expected_sha256: Annotated[
+        str,
+        Field(description="The sha256 that read_file (or the previous write) returned for this file."),
+    ],
+) -> dict[str, Any]:
+    """Replace a file only if it is unchanged since you read it. Agent key only.
+
+    Sends If-Match: "<expected_sha256>" to the control plane's sync-write
+    route. If anyone changed the file after that read, nothing is written and
+    the result is {"error": "stale"}: read it again, merge, and decide
+    whether to write. Nothing retries automatically.
+
+    Needs an agent key with write scope and the share UUID (not a web slug);
+    email/password (JWT) mode raises, as for every write tool.
+
+    Args:
+        share_id: UUID of the folder share.
+        file_path: File path within the share (e.g. "notes/todo.md").
+        content: Full text content, written as UTF-8.
+        expected_sha256: The sha256 from read_file or the previous write.
+
+    Returns:
+        The server's result (path, sha256, size, updated_at) plus
+        "operation": "updated", or {"error", "message"} if it was refused.
+        The returned sha256 is the token for the next update_file.
+    """
+    token = expected_sha256.strip().lower()
+    if not _SHA256_HEX.match(token):
+        return {
+            "error": "invalid_expected_sha256",
+            "message": "expected_sha256 must be the 64-character hex sha256 that read_file returned.",
+        }
+    return _guarded_write(
+        share_id, file_path, content, {"If-Match": f'"{token}"'}, "update_file", "updated"
+    )
+
+
 @mcp.tool(annotations=_WRITE)
 def upsert_file(
     share_id: Annotated[
@@ -626,7 +805,11 @@ def upsert_file(
         str, Field(description="Full text content to write, replacing the file if it already exists.")
     ],
 ) -> dict[str, Any]:
-    """Create or overwrite a file in a shared folder; it syncs into subscribers' vaults. Agent key only.
+    """Create or overwrite a file unconditionally; prefer create_file / update_file. Agent key only.
+
+    The last writer wins: an edit someone made after you read the file is
+    silently replaced. create_file and update_file write only if the file is
+    still as you read it.
 
     **Write access is agent-key-only by design** — this is the sanctioned,
     permanent policy (not a temporary gap): agent-key mode is the only
