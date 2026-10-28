@@ -14,19 +14,93 @@ Usage:
 from __future__ import annotations
 
 import hashlib
+import ipaddress
+import json
 import os
 import sys
 import re
 import time
 import uuid
 from typing import Annotated, Any
+from urllib.parse import urlsplit
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+
+def _validate_http_authority(value: str) -> None:
+    """Require an exact ASCII DNS name/IP, optionally with a numeric port."""
+    if not value or not value.isascii() or any(c.isspace() for c in value):
+        raise ValueError("expected an exact host[:port]")
+    if any(c in value for c in "*/?#@\\%"):
+        raise ValueError("expected an exact host[:port], without wildcards or URL components")
+    parsed = urlsplit("//" + value)
+    host = parsed.hostname
+    port = parsed.port  # Also rejects non-numeric/out-of-range ports and unbracketed IPv6.
+    if not host or parsed.netloc != value or value.endswith(":") or port == 0:
+        raise ValueError("expected an exact host[:port] with a port between 1 and 65535")
+    if value.startswith("["):
+        if not re.fullmatch(r"\[[0-9a-fA-F:.]+\](?::[0-9]+)?", value):
+            raise ValueError("expected a bracketed IPv6 address and optional numeric port")
+        ipaddress.IPv6Address(host)
+    elif re.fullmatch(r"[0-9.]+", host) and "." in host:
+        ipaddress.IPv4Address(host)
+    elif len(host) > 253 or any(
+        not re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", label)
+        for label in host.split(".")
+    ):
+        raise ValueError("expected a valid DNS name or bracketed IPv6 address")
+
+
+def _parse_http_allowlist(name: str, raw: str, *, origins: bool = False) -> list[str]:
+    try:
+        values = json.loads(raw)
+        if not isinstance(values, list) or not values:
+            raise ValueError("expected a nonempty JSON array")
+        for value in values:
+            if not isinstance(value, str):
+                raise ValueError("expected string entries")
+            if origins:
+                parsed = urlsplit(value)
+                if not value.startswith("https://") or parsed.path or parsed.query or parsed.fragment:
+                    raise ValueError("expected an HTTPS origin without a path, query or fragment")
+                _validate_http_authority(value[len("https://"):])
+            else:
+                _validate_http_authority(value)
+    except ValueError as exc:
+        raise ValueError(f"Invalid {name}: {exc}") from exc
+    return values
+
+
+def _http_transport_security() -> TransportSecuritySettings | None:
+    """Fix public HTTP identities at construction; leave local SDK defaults intact."""
+    hosts = os.environ.get("RELAY_MCP_ALLOWED_HOSTS")
+    origins = os.environ.get("RELAY_MCP_ALLOWED_ORIGINS")
+    if hosts is None and origins is None:
+        return None
+    if hosts is None or origins is None:
+        raise ValueError("Set both RELAY_MCP_ALLOWED_HOSTS and RELAY_MCP_ALLOWED_ORIGINS")
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_parse_http_allowlist("RELAY_MCP_ALLOWED_HOSTS", hosts),
+        allowed_origins=_parse_http_allowlist("RELAY_MCP_ALLOWED_ORIGINS", origins, origins=True),
+    )
+
+
+def _is_loopback_bind(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 # ── Server setup ─────────────────────────────────────────────
+_HTTP_TRANSPORT_SECURITY = _http_transport_security()
 mcp = FastMCP(
     "evc-relay",
     instructions=(
@@ -43,6 +117,7 @@ mcp = FastMCP(
         "`update_file` need the share UUID, not a web slug. Delete, rename "
         "and DOC-share live content are not supported."
     ),
+    transport_security=_HTTP_TRANSPORT_SECURITY,
 )
 
 # Reused across the read-only tools below — one definition, one place to change.
@@ -861,6 +936,11 @@ def main():
             i += 1
 
     if transport in ("http", "streamable-http"):
+        if not _is_loopback_bind(host) and _HTTP_TRANSPORT_SECURITY is None:
+            raise ValueError(
+                "External HTTP binds require both RELAY_MCP_ALLOWED_HOSTS and "
+                "RELAY_MCP_ALLOWED_ORIGINS as nonempty JSON arrays"
+            )
         mcp.settings.host = host
         mcp.settings.port = port
         mcp.run(transport="streamable-http")

@@ -46,7 +46,7 @@ against) and a GitHub build-provenance attestation. Install by pinned version
 and verify the hash:
 
 ```bash
-TAG=v1.0.9.1
+TAG=v1.0.9.2
 gh release download "$TAG" --repo artemgordinskiy/evc-team-relay-mcp \
   --pattern '*.whl' --pattern SHA256SUMS --dir evc-mcp
 (cd evc-mcp && sha256sum --ignore-missing --strict -c SHA256SUMS)
@@ -269,20 +269,11 @@ Delete and rename are not supported.
 
 ## Remote Deployment (HTTP Transport)
 
-For shared or server-side deployments, run as an HTTP server:
+Install the guarded fork wheel from its verified release (see above), then run
+on loopback:
 
 ```bash
-# Direct
-uv run relay_mcp.py --transport http --port 8888
-
-# Docker (pulls from Docker Hub automatically)
-RELAY_CP_URL=https://cp.yourdomain.com \
-RELAY_EMAIL=agent@yourdomain.com \
-RELAY_PASSWORD=your-password \
-docker compose up -d
-
-# Or pull explicitly
-docker pull deadalusevc/evc-team-relay-mcp:latest
+evc-team-relay-mcp --transport http --port 8888
 ```
 
 **By default the server binds to `127.0.0.1` (localhost-only)** — the endpoint is not
@@ -317,17 +308,31 @@ goes through the SSH tunnel, and the server's bind address never needs to change
 
 ### Public / reverse-proxy binding (opt-in)
 
-If you genuinely need the server to accept connections from other hosts directly
-(e.g. it sits behind a reverse proxy that terminates TLS and handles auth), pass
-`--host` explicitly:
+For an external bind behind a TLS-terminating, authenticated reverse proxy,
+configure both lists **before starting the process**:
 
 ```bash
-uv run relay_mcp.py --transport http --port 8888 --host 0.0.0.0
+export RELAY_MCP_ALLOWED_HOSTS='["evc-mcp.example.com","evc-mcp.example.com:443"]'
+export RELAY_MCP_ALLOWED_ORIGINS='["https://evc-mcp.example.com"]'
+evc-team-relay-mcp --transport http --port 8888 --host 0.0.0.0
 ```
 
-Only do this behind a reverse proxy or firewall — the MCP HTTP endpoint itself
-has no built-in authentication, so binding it to `0.0.0.0` on an open network
-exposes every relay tool call to anyone who can reach the port.
+These are nonempty JSON arrays of exact Host header values and HTTPS origins.
+Host entries accept a DNS name/IP and optional numeric port (IPv6 must be
+bracketed). Origins have no path, trailing slash, query or fragment. Wildcards,
+empty/malformed entries, and configuring only one list fail at startup. External
+HTTP binds require both lists; stdio and loopback with neither keep the SDK's
+localhost defaults.
+
+The DNS-rebinding guard remains enabled. The allowlists are installed when
+FastMCP is constructed; changing the bind address does not expand them. List
+only identities the client actually sends. A cloud client may omit Origin; a
+present Origin must match exactly. Preserve Host and Origin through the proxy;
+do not rewrite Host to localhost.
+
+The guard validates HTTP identities, not user authentication. Keep the origin
+restricted to the authenticated proxy: this MCP server has no built-in OAuth
+and each reachable tool can use its configured relay credentials.
 
 ---
 
