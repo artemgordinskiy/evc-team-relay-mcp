@@ -65,32 +65,19 @@ SYNC_ARTIFACTS = [
 ]
 
 
-class TestJwtListFiles:
-    def test_hits_shares_files_index_not_documents(self):
-        import relay_mcp
-
-        client = _mock_client(get_resp=_mock_response(200, SYNC_ARTIFACTS))
-        with patch.object(relay_mcp, "_get_client", return_value=client):
-            result = relay_mcp._jwt_list_files(SHARE_ID)
-
-        url = client.get.call_args[0][0]
-        assert url == f"{BASE_URL}/v1/shares/{SHARE_ID}/files-index"
-        assert "documents" not in url
-        assert client.get.call_args[1]["headers"] == {"Authorization": "Bearer fake-jwt"}
-        assert result[FILE_PATH]["sha256"] == "abc123"
-
-
 class TestListFilesJwtMode:
-    def test_returns_files_map_shape(self):
+    def test_hits_shares_files_index_not_documents(self):
         import relay_mcp
 
         client = _mock_client(get_resp=_mock_response(200, SYNC_ARTIFACTS))
         with patch.object(relay_mcp, "_get_client", return_value=client):
             result = relay_mcp.list_files(SHARE_ID)
 
+        url = client.get.call_args[0][0]
+        assert url == f"{BASE_URL}/v1/shares/{SHARE_ID}/files-index"
+        assert client.get.call_args[1]["headers"] == {"Authorization": "Bearer fake-jwt"}
         assert result["share_id"] == SHARE_ID
-        assert FILE_PATH in result["files"]
-        assert client.get.call_args[0][0].endswith("/files-index")
+        assert result["files"][FILE_PATH]["sha256"] == "abc123"
 
 
 class TestTrSearchJwtMode:

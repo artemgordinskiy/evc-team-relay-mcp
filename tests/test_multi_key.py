@@ -13,6 +13,17 @@ SHARE_SPARK = "spark"
 KEY_MESH = "key-for-mesh-abc"
 KEY_SPARK = "key-for-spark-xyz"
 MULTI_KEYS_ENV = f"{SHARE_MESH}:{KEY_MESH},{SHARE_SPARK}:{KEY_SPARK}"
+UUID_MESH = "5ba2a6c4-3b9b-485b-b0e4-b8b8691dc49a"
+UUID_SPARK = "f30af6ec-318b-4198-8c1c-b290b12e39d8"
+UUID_KEYS_ENV = f"{UUID_MESH}:{KEY_MESH},{UUID_SPARK}:{KEY_SPARK}"
+
+
+def _index(*paths: str) -> list[dict]:
+    """A sync files-index response: a list of SyncArtifactItem."""
+    return [
+        {"path": path, "type": "doc", "size": 3, "sha256": "a" * 64, "updated_at": "2026-10-28T20:00:00Z"}
+        for path in paths
+    ]
 
 
 def _mock_response(status: int, body: dict | list | str) -> MagicMock:
@@ -164,61 +175,59 @@ class TestAuthenticateMultiKey:
 
 
 class TestListSharesMultiKey:
-    def test_fetches_metadata_for_each_share(self, monkeypatch):
+    def test_reports_each_share_from_its_sync_index(self, monkeypatch):
         import relay_mcp
-        monkeypatch.setenv("RELAY_AGENT_KEYS", MULTI_KEYS_ENV)
+        monkeypatch.setenv("RELAY_AGENT_KEYS", UUID_KEYS_ENV)
 
-        mesh_data = {"id": "uuid-mesh", "kind": "folder", "path": "mesh"}
-        spark_data = {"id": "uuid-spark", "kind": "folder", "path": "spark"}
-
-        mesh_client = _mock_client(get_resp=_mock_response(200, mesh_data))
-        spark_client = _mock_client(get_resp=_mock_response(200, spark_data))
+        mesh_client = _mock_client(get_resp=_mock_response(200, _index("a.md", "b.md")))
+        spark_client = _mock_client(get_resp=_mock_response(200, _index()))
         clients = iter([mesh_client, spark_client])
 
         with patch.object(relay_mcp, "_get_client", side_effect=lambda: next(clients)):
             result = json.loads(relay_mcp.list_shares())
 
-        assert len(result) == 2
-        ids = {s["id"] for s in result}
-        assert "uuid-mesh" in ids
-        assert "uuid-spark" in ids
+        assert result == [
+            {"id": UUID_MESH, "kind": "unknown", "file_count": 2},
+            {"id": UUID_SPARK, "kind": "unknown", "file_count": 0},
+        ]
 
-    def test_uses_per_share_key_in_header(self, monkeypatch):
+    def test_uses_per_share_key_on_the_non_web_route(self, monkeypatch):
+        """/v1/web/* only exists when web publishing is enabled; the sync
+        files-index route is the one an agent key can always reach."""
         import relay_mcp
-        monkeypatch.setenv("RELAY_AGENT_KEYS", MULTI_KEYS_ENV)
+        monkeypatch.setenv("RELAY_AGENT_KEYS", UUID_KEYS_ENV)
 
-        mesh_client = _mock_client(get_resp=_mock_response(200, {"id": "m", "kind": "folder"}))
-        spark_client = _mock_client(get_resp=_mock_response(200, {"id": "s", "kind": "folder"}))
+        mesh_client = _mock_client(get_resp=_mock_response(200, _index()))
+        spark_client = _mock_client(get_resp=_mock_response(200, _index()))
         clients = iter([mesh_client, spark_client])
 
         with patch.object(relay_mcp, "_get_client", side_effect=lambda: next(clients)):
             relay_mcp.list_shares()
 
         mesh_client.get.assert_called_once()
+        assert mesh_client.get.call_args[0][0] == f"{BASE_URL}/v1/shares/{UUID_MESH}/files-index"
         assert mesh_client.get.call_args[1]["headers"] == {"X-Agent-Key": KEY_MESH}
         spark_client.get.assert_called_once()
+        assert spark_client.get.call_args[0][0] == f"{BASE_URL}/v1/shares/{UUID_SPARK}/files-index"
         assert spark_client.get.call_args[1]["headers"] == {"X-Agent-Key": KEY_SPARK}
 
-    def test_filters_by_kind(self, monkeypatch):
+    def test_kind_filter_excludes_shares_of_unknown_kind(self, monkeypatch):
         import relay_mcp
-        monkeypatch.setenv("RELAY_AGENT_KEYS", MULTI_KEYS_ENV)
+        monkeypatch.setenv("RELAY_AGENT_KEYS", UUID_KEYS_ENV)
 
-        mesh_client = _mock_client(get_resp=_mock_response(200, {"id": "m", "kind": "folder"}))
-        spark_client = _mock_client(get_resp=_mock_response(200, {"id": "s", "kind": "doc"}))
-        clients = iter([mesh_client, spark_client])
+        client = _mock_client(get_resp=_mock_response(200, _index("a.md")))
 
-        with patch.object(relay_mcp, "_get_client", side_effect=lambda: next(clients)):
+        with patch.object(relay_mcp, "_get_client", return_value=client):
             result = json.loads(relay_mcp.list_shares(kind="folder"))
 
-        assert len(result) == 1
-        assert result[0]["kind"] == "folder"
+        assert result == []
 
     def test_failed_share_fetch_reported_as_error_not_silently_dropped(self, monkeypatch):
         import relay_mcp
-        monkeypatch.setenv("RELAY_AGENT_KEYS", MULTI_KEYS_ENV)
+        monkeypatch.setenv("RELAY_AGENT_KEYS", UUID_KEYS_ENV)
 
         mesh_client = _mock_client(get_resp=_mock_response(403, {"error": "forbidden"}))
-        spark_client = _mock_client(get_resp=_mock_response(200, {"id": "s", "kind": "folder"}))
+        spark_client = _mock_client(get_resp=_mock_response(200, _index("a.md")))
         clients = iter([mesh_client, spark_client])
 
         with patch.object(relay_mcp, "_get_client", side_effect=lambda: next(clients)):
@@ -227,58 +236,37 @@ class TestListSharesMultiKey:
         # A real failure must change the response SHAPE (object with
         # errors), never just quietly shrink the array — otherwise "one
         # share is broken" and "you only have one share" look identical.
-        assert "errors" in result
-        assert SHARE_MESH in result["errors"]
-        assert "403" in result["errors"][SHARE_MESH]
-        assert len(result["shares"]) == 1
-        assert result["shares"][0]["id"] == "s"
+        assert "403" in result["errors"][UUID_MESH]
+        assert result["shares"] == [{"id": UUID_SPARK, "kind": "unknown", "file_count": 1}]
 
-    def test_uuid_share_ref_falls_back_to_files_index_on_404(self, monkeypatch):
-        """RELAY_AGENT_KEYS is keyed by UUID in every real config, and the
-        bare metadata endpoint only resolves slugs — every real share used
-        to 404 there and vanish silently. This is the fix: a 404 on the bare
-        endpoint falls back to the files-index endpoint, which DOES accept
-        a UUID and proves the share is real."""
+    def test_share_genuinely_gone_reports_error(self, monkeypatch):
         import relay_mcp
-        uuid_ref = "5ba2a6c4-3b9b-485b-b0e4-b8b8691dc49a"
-        monkeypatch.setenv("RELAY_AGENT_KEYS", f"{uuid_ref}:{KEY_MESH}")
+        monkeypatch.setenv("RELAY_AGENT_KEYS", f"{UUID_MESH}:{KEY_MESH}")
 
-        bare_404 = _mock_response(404, {"error": {"message": "Share not found or not published"}})
-        files_index_200 = _mock_response(200, {"share_id": uuid_ref, "files": {"a.md": {}, "b.md": {}}})
-        client = _mock_client()
-        client.get.side_effect = [bare_404, files_index_200]
-
-        with patch.object(relay_mcp, "_get_client", return_value=client):
-            result = json.loads(relay_mcp.list_shares())
-
-        assert result == [{"id": uuid_ref, "kind": "unknown", "file_count": 2}]
-        # second call must hit the files-index endpoint with the same key
-        second_call_url = client.get.call_args_list[1][0][0]
-        assert second_call_url.endswith(f"/v1/web/shares/{uuid_ref}/files-index")
-        assert client.get.call_args_list[1][1]["headers"] == {"X-Agent-Key": KEY_MESH}
-
-    def test_uuid_share_ref_genuinely_gone_reports_error(self, monkeypatch):
-        """404 on both the bare endpoint AND the files-index fallback means
-        the share is actually gone — must surface as an error, not silently
-        vanish from the list."""
-        import relay_mcp
-        uuid_ref = "00000000-0000-0000-0000-000000000000"
-        monkeypatch.setenv("RELAY_AGENT_KEYS", f"{uuid_ref}:{KEY_MESH}")
-
-        bare_404 = _mock_response(404, {"error": {"message": "Share not found or not published"}})
-        files_index_404 = _mock_response(404, {"error": {"message": "Share not found"}})
-        client = _mock_client()
-        client.get.side_effect = [bare_404, files_index_404]
+        client = _mock_client(get_resp=_mock_response(404, {"error": {"message": "Share not found"}}))
 
         with patch.object(relay_mcp, "_get_client", return_value=client):
             result = json.loads(relay_mcp.list_shares())
 
         assert result["shares"] == []
-        assert "404" in result["errors"][uuid_ref]
+        assert "404" in result["errors"][UUID_MESH]
+
+    def test_slug_keyed_entry_reported_without_a_request(self, monkeypatch):
+        import relay_mcp
+        monkeypatch.setenv("RELAY_AGENT_KEYS", f"{SHARE_MESH}:{KEY_MESH},{UUID_SPARK}:{KEY_SPARK}")
+
+        client = _mock_client(get_resp=_mock_response(200, _index()))
+
+        with patch.object(relay_mcp, "_get_client", return_value=client):
+            result = json.loads(relay_mcp.list_shares())
+
+        assert "share UUID" in result["errors"][SHARE_MESH]
+        assert result["shares"] == [{"id": UUID_SPARK, "kind": "unknown", "file_count": 0}]
+        client.get.assert_called_once()
 
     def test_bad_key_reports_401_as_error(self, monkeypatch):
         import relay_mcp
-        monkeypatch.setenv("RELAY_AGENT_KEYS", MULTI_KEYS_ENV)
+        monkeypatch.setenv("RELAY_AGENT_KEYS", UUID_KEYS_ENV)
 
         client = _mock_client(get_resp=_mock_response(401, {"error": {"message": "Invalid agent key"}}))
 
@@ -297,30 +285,72 @@ class TestListSharesMultiKey:
 
 
 class TestListFilesMultiKey:
-    def test_uses_share_specific_key(self, monkeypatch):
+    def test_uses_share_specific_key_on_the_non_web_route(self, monkeypatch):
         import relay_mcp
-        monkeypatch.setenv("RELAY_AGENT_KEYS", MULTI_KEYS_ENV)
+        monkeypatch.setenv("RELAY_AGENT_KEYS", UUID_KEYS_ENV)
 
-        files_resp = _mock_response(200, {"share_id": SHARE_SPARK, "files": {}})
-        client = _mock_client(get_resp=files_resp)
+        client = _mock_client(get_resp=_mock_response(200, _index("notes/hello.md")))
 
         with patch.object(relay_mcp, "_get_client", return_value=client):
-            relay_mcp.list_files(SHARE_SPARK)
+            result = relay_mcp.list_files(UUID_SPARK)
 
-        call_args = client.get.call_args
-        assert call_args[1]["headers"] == {"X-Agent-Key": KEY_SPARK}
-        assert f"/v1/web/shares/{SHARE_SPARK}/files-index" in call_args[0][0]
+        assert client.get.call_args[0][0] == f"{BASE_URL}/v1/shares/{UUID_SPARK}/files-index"
+        assert client.get.call_args[1]["headers"] == {"X-Agent-Key": KEY_SPARK}
+        assert result == {
+            "share_id": UUID_SPARK,
+            "files": {
+                "notes/hello.md": {
+                    "type": "doc",
+                    "size": 3,
+                    "modified_at": "2026-10-28T20:00:00Z",
+                    "sha256": "a" * 64,
+                }
+            },
+        }
+
+    def test_slug_is_refused_without_a_request(self, monkeypatch):
+        import relay_mcp
+        monkeypatch.setenv("RELAY_AGENT_KEYS", f"{SHARE_SPARK}:{KEY_SPARK}")
+
+        client = _mock_client()
+        with patch.object(relay_mcp, "_get_client", return_value=client):
+            result = relay_mcp.list_files(SHARE_SPARK)
+
+        assert result["ok"] is False
+        assert result["error"] == "invalid_share_id"
+        client.get.assert_not_called()
 
 
 class TestTrSearchMultiKey:
-    def test_uses_share_specific_key(self, monkeypatch):
+    def test_searches_the_sync_index_with_share_specific_key(self, monkeypatch):
         import relay_mcp
-        monkeypatch.setenv("RELAY_AGENT_KEYS", MULTI_KEYS_ENV)
+        monkeypatch.setenv("RELAY_AGENT_KEYS", UUID_KEYS_ENV)
 
-        files_resp = _mock_response(200, {"files": {"notes/hello.md": {"modified_at": None}}})
-        client = _mock_client(get_resp=files_resp)
+        client = _mock_client(get_resp=_mock_response(200, _index("notes/hello.md", "notes/other.md")))
 
         with patch.object(relay_mcp, "_get_client", return_value=client):
-            relay_mcp.tr_search(SHARE_MESH, "hello")
+            result = json.loads(relay_mcp.tr_search(UUID_MESH, "HELLO"))
 
+        client.get.assert_called_once()
+        assert client.get.call_args[0][0] == f"{BASE_URL}/v1/shares/{UUID_MESH}/files-index"
         assert client.get.call_args[1]["headers"] == {"X-Agent-Key": KEY_MESH}
+        assert result == [
+            {
+                "id": None,
+                "title": "hello",
+                "path": "notes/hello.md",
+                "relay_url": f"relay://{UUID_MESH}/notes/hello.md",
+                "updated_at": "2026-10-28T20:00:00Z",
+            }
+        ]
+
+    def test_slug_is_refused_without_a_request(self, monkeypatch):
+        import relay_mcp
+        monkeypatch.setenv("RELAY_AGENT_KEYS", f"{SHARE_MESH}:{KEY_MESH}")
+
+        client = _mock_client()
+        with patch.object(relay_mcp, "_get_client", return_value=client):
+            result = json.loads(relay_mcp.tr_search(SHARE_MESH, "hello"))
+
+        assert result["error"] == "invalid_share_id"
+        client.get.assert_not_called()

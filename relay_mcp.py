@@ -260,23 +260,8 @@ def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {_ensure_token()}"}
 
 
-def _jwt_list_files(share_id: str) -> dict[str, dict]:
-    """Fetch the CAS sync-artifact file index for a folder share (email/password mode).
-
-    Uses GET /v1/shares/{share_id}/files-index (Bearer JWT) — the real, working
-    counterpart to the agent-key /v1/web/shares/{id}/files-index endpoint. Only
-    items uploaded via sync-upload (source=sync-artifact) are returned; this is
-    a server-side filter on the shared endpoint, not a client limitation.
-
-    Returns {path: {type, size, modified_at, sha256}}.
-    """
-    with _get_client() as client:
-        r = client.get(
-            f"{_get_base_url()}/v1/shares/{share_id}/files-index",
-            headers=_headers(),
-        )
-        r.raise_for_status()
-        items = r.json()
+def _normalize_files_index(items: list[dict[str, Any]]) -> dict[str, dict]:
+    """Map the sync files-index list to {path: {type, size, modified_at, sha256}}."""
     return {
         item["path"]: {
             "type": item.get("type", "doc"),
@@ -286,6 +271,23 @@ def _jwt_list_files(share_id: str) -> dict[str, dict]:
         }
         for item in items
     }
+
+
+def _list_sync_files(share_uuid: str, headers: dict[str, str]) -> dict[str, dict]:
+    """Fetch the CAS sync-artifact file index for a folder share.
+
+    Uses GET /v1/shares/{uuid}/files-index, which accepts either an agent key
+    (read scope) or a Bearer JWT. The /v1/web/shares/... counterparts are only
+    served when the control plane has web publishing enabled, so they are not
+    used. Only items uploaded through the sync protocol (source=sync-artifact)
+    are returned; this is a server-side filter, not a client limitation.
+
+    Returns {path: {type, size, modified_at, sha256}}.
+    """
+    with _get_client() as client:
+        r = client.get(f"{_get_base_url()}/v1/shares/{share_uuid}/files-index", headers=headers)
+        r.raise_for_status()
+    return _normalize_files_index(r.json())
 
 
 _NO_BACKEND_ROUTE = (
@@ -483,12 +485,11 @@ def list_shares(
     In multi-key mode (RELAY_AGENT_KEYS set): returns metadata for every share
     that has a configured key, fetched via per-share agent-key auth.
 
-    RELAY_AGENT_KEYS is typically keyed by share UUID, but the bare
-    share-metadata endpoint (/v1/web/shares/{ref}) only resolves web slugs —
-    a UUID always 404s there. When that happens this falls back to the
-    UUID-addressable files-index endpoint, which proves the share is real
-    and reachable but can't report kind/path/visibility (reported as
-    kind="unknown", plus a file_count instead).
+    Each configured share is checked through its UUID-addressable sync
+    files-index (/v1/shares/{uuid}/files-index), which proves the share is
+    real and reachable with that key but can't report kind/path/visibility
+    (reported as kind="unknown", plus a file_count). RELAY_AGENT_KEYS entries
+    must be keyed by share UUID; a web-slug entry is reported as an error.
 
     A per-share failure (bad key, wrong share, share genuinely gone) is
     NEVER silently dropped — it lands in the response's `errors` field.
@@ -507,9 +508,9 @@ def list_shares(
         owned_only: If true, only return shares owned by the user (email/password mode only).
 
     Returns:
-        On full success: a bare JSON array of shares (id, kind, path,
-        visibility, user_role — or id/kind="unknown"/file_count for
-        UUID-resolved entries).
+        On full success: a bare JSON array of shares — id, kind, path,
+        visibility, user_role in email/password mode; id, kind="unknown",
+        file_count in multi-key mode.
         If any share failed to resolve: a JSON object
         {"shares": [...], "errors": {share_ref: "reason"}} instead of a
         silently-shortened array.
@@ -523,52 +524,26 @@ def list_shares(
         errors: dict[str, str] = {}
 
         for share_ref, key in multi_keys.items():
+            share_uuid = _share_uuid(share_ref)
+            if share_uuid is None:
+                errors[share_ref] = _invalid_share_id(share_ref)["message"]
+                continue
             try:
                 with _get_client() as client:
                     r = client.get(
-                        f"{_get_base_url()}/v1/web/shares/{share_ref}",
+                        f"{_get_base_url()}/v1/shares/{share_uuid}/files-index",
                         headers=_agent_headers(key),
                     )
             except Exception as e:
                 errors[share_ref] = f"{type(e).__name__}: {e}"
                 continue
 
-            if r.status_code == 200:
-                data = r.json()
-                if not kind or data.get("kind") == kind:
-                    shares.append(data)
-                continue
-
-            if r.status_code != 404:
+            if r.status_code != 200:
                 errors[share_ref] = f"HTTP {r.status_code}: {r.text[:200]}"
                 continue
 
-            # Bare endpoint only resolves slugs; share_ref is a UUID in every
-            # real config. Fall back to the UUID-addressable files-index
-            # endpoint before concluding the share is really gone.
-            try:
-                with _get_client() as client:
-                    r2 = client.get(
-                        f"{_get_base_url()}/v1/web/shares/{share_ref}/files-index",
-                        headers=_agent_headers(key),
-                    )
-            except Exception as e:
-                errors[share_ref] = f"{type(e).__name__}: {e}"
-                continue
-
-            if r2.status_code == 200:
-                if not kind:
-                    data2 = r2.json()
-                    shares.append(
-                        {
-                            "id": share_ref,
-                            "kind": "unknown",
-                            "file_count": len(data2.get("files", {})),
-                        }
-                    )
-                continue
-
-            errors[share_ref] = f"HTTP {r2.status_code}: {r2.text[:200]}"
+            if not kind:
+                shares.append({"id": share_ref, "kind": "unknown", "file_count": len(r.json())})
 
         if errors:
             return json.dumps({"shares": shares, "errors": errors})
@@ -597,46 +572,34 @@ def list_shares(
 def list_files(
     share_id: Annotated[
         str,
-        Field(description="UUID or web slug of the folder share, as returned by list_shares."),
+        Field(description="UUID of the folder share, as returned by list_shares."),
     ],
 ) -> dict[str, Any]:
     """List every file in a shared folder with its metadata.
 
     Read-only; does not download file contents (use read_file for that).
-
-    In agent-key mode (RELAY_AGENT_KEYS or RELAY_AGENT_KEY is set): uses the
-    agent-key endpoint; share_id may be a UUID or web slug.
-
-    In email/password mode: share_id must be a UUID.
+    Works with an agent key (needs `read` scope) or in email/password mode;
+    share_id must be the share UUID. Lists the files in the share's sync
+    index, which are the files read_file and update_file can work on.
 
     Args:
-        share_id: UUID or web slug of the folder share, e.g.
-            "a1b2c3d4-..." or "research-vault".
+        share_id: UUID of the folder share, e.g. "a1b2c3d4-...".
 
     Returns:
-        Object with share_id and files map (path -> metadata). The exact set
-        of metadata keys per file is server-controlled, hence the loose
-        dict[str, Any] shape rather than a strict per-field schema.
+        {"share_id", "files": {path: {type, size, modified_at, sha256}}}, or
+        {"ok": false, "error": "invalid_share_id", ...} for a non-UUID share_id.
     """
-    agent_key = _get_key_for_share(share_id)
-    if agent_key:
-        with _get_client() as client:
-            r = client.get(
-                f"{_get_base_url()}/v1/web/shares/{share_id}/files-index",
-                headers=_agent_headers(agent_key),
-            )
-            r.raise_for_status()
-        return r.json()
-
-    files = _jwt_list_files(share_id)
-    return {"share_id": share_id, "files": files}
+    share_uuid = _share_uuid(share_id)
+    if share_uuid is None:
+        return _invalid_share_id(share_id)
+    return {"share_id": share_id, "files": _list_sync_files(share_uuid, _sync_headers(share_id))}
 
 
 @mcp.tool(annotations=_READ_ONLY)
 def tr_search(
     share_id: Annotated[
         str,
-        Field(description="UUID or web slug of the folder share, as returned by list_shares."),
+        Field(description="UUID of the folder share, as returned by list_shares."),
     ],
     query: Annotated[str, Field(description="Case-insensitive substring matched against file paths.")],
     limit: Annotated[int, Field(description="Maximum number of matches to return.")] = 20,
@@ -644,65 +607,45 @@ def tr_search(
     """Find files in a shared folder by a case-insensitive match on path or name.
 
     Read-only; does not download file contents (use read_file for that).
-    Example: `tr_search(share_id="research-vault", query="roadmap")`.
+    Example: `tr_search(share_id="a1b2c3d4-...", query="roadmap")`.
 
-    In agent-key mode (RELAY_AGENT_KEY is set): share_id may be UUID or web slug.
-    In email/password mode: share_id must be a UUID.
+    Works with an agent key (needs `read` scope) or in email/password mode;
+    share_id must be the share UUID.
 
     Args:
-        share_id: UUID or web slug of the folder share.
+        share_id: UUID of the folder share.
         query: Search string matched case-insensitively against file paths.
         limit: Max results to return (default 20).
 
     Returns:
         JSON list of matching files:
         [{"id": doc_id_or_null, "title": filename_without_ext, "path": full_path,
-          "relay_url": "relay://<slug>/<path>", "updated_at": null}]
+          "relay_url": "relay://<slug_or_uuid>/<path>", "updated_at": ...}],
+        or a JSON {"ok": false, "error": "invalid_share_id", ...} object.
     """
     import json
     from pathlib import Path
 
+    share_uuid = _share_uuid(share_id)
+    if share_uuid is None:
+        return json.dumps(_invalid_share_id(share_id))
     agent_key = _get_key_for_share(share_id)
+    files = _list_sync_files(share_uuid, _agent_headers(agent_key) if agent_key else _headers())
 
-    if agent_key:
-        with _get_client() as client:
-            r = client.get(
-                f"{_get_base_url()}/v1/web/shares/{share_id}/files-index",
-                headers=_agent_headers(agent_key),
-            )
-            r.raise_for_status()
-            files_data = r.json()
-
-        files = files_data.get("files", {})
-        q = query.lower()
-        matches = [
-            {
-                "id": None,
-                "title": Path(path).stem,
-                "path": path,
-                "relay_url": f"relay://{share_id}/{path}",
-                "updated_at": meta.get("modified_at"),
-            }
-            for path, meta in sorted(files.items())
-            if q in path.lower()
-        ]
-        return json.dumps(matches[:limit])
-
-    # Email/password mode
-    files = _jwt_list_files(share_id)
-
-    # Resolve share slug for relay:// URL; falls back to UUID on error
+    # In email/password mode, resolve the share slug for the relay:// URL;
+    # agent keys cannot list shares, so they keep the UUID.
     slug = share_id
-    try:
-        with _get_client() as client:
-            rs = client.get(f"{_get_base_url()}/v1/shares", headers=_headers())
-            if rs.status_code == 200:
-                for s in rs.json():
-                    if s.get("id") == share_id and s.get("slug"):
-                        slug = s["slug"]
-                        break
-    except Exception:
-        pass
+    if not agent_key:
+        try:
+            with _get_client() as client:
+                rs = client.get(f"{_get_base_url()}/v1/shares", headers=_headers())
+                if rs.status_code == 200:
+                    for s in rs.json():
+                        if s.get("id") == share_id and s.get("slug"):
+                            slug = s["slug"]
+                            break
+        except Exception:
+            pass
 
     q = query.lower()
     matches = [

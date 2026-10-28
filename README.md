@@ -46,7 +46,7 @@ against) and a GitHub build-provenance attestation. Install by pinned version
 and verify the hash:
 
 ```bash
-TAG=v1.0.9.2
+TAG=v1.0.9.3
 gh release download "$TAG" --repo artemgordinskiy/evc-team-relay-mcp \
   --pattern '*.whl' --pattern SHA256SUMS --dir evc-mcp
 (cd evc-mcp && sha256sum --ignore-missing --strict -c SHA256SUMS)
@@ -62,7 +62,9 @@ configurations below.
 Writes need an agent key with the `write` scope; reads need `read`. Give each
 agent its own key per share with `RELAY_AGENT_KEYS="<share-uuid>:<key>,..."`,
 and a read-only key where the agent should not write. Email/password (JWT) mode
-is read-only: write tools raise.
+is read-only: write tools raise. Every tool addresses shares by UUID through the
+`/v1/shares/{uuid}/...` sync routes, so none depends on web publishing being
+enabled on the control plane; a web slug is refused with `invalid_share_id`.
 
 ### Errors
 
@@ -259,7 +261,7 @@ Authentication is automatic — the server logs in and refreshes tokens internal
 
 | Group | Tools | Status |
 |-------|-------|--------|
-| **Agent key**, folder shares | `list_files`, `read_file`, `create_file`, `update_file` | Working; writes need the `write` scope |
+| **Agent key**, folder shares | `list_shares`, `list_files`, `tr_search`, `read_file`, `create_file`, `update_file` | Working; writes need the `write` scope |
 | **JWT** (email/password) | `list_files`, `tr_search`, `read_file` | Working, **read-only** by design |
 | **No backend route in either mode** | `read_document` | Always raises `ValueError` |
 
